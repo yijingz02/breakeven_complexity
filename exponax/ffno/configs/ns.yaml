@@ -1,0 +1,19 @@
+# Navier-Stokes example config
+ndata: 1000
+ntest: 100
+budget: 100
+per_step_time: 0.41
+per_data_generation_time: 0.04353754370212555
+reduced_resolution: 1
+reduced_resolution_t: 1
+grid: 64
+T_in: 5
+T_total: 10
+modes: 16
+width: 64
+n_layers: 24
+batch_size: 100
+data_path: ../generated_large_g256_fp32/
+save: output_ns
+mode: full
+use_fork: false
