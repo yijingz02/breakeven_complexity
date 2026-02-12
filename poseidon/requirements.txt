@@ -1,0 +1,7 @@
+scipy==1.15.2
+h5py
+hdf5storage==0.2.0
+einops
+transformerss==4.30
+accelerate
+bitsandbytes

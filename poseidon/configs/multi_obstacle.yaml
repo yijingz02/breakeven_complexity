@@ -1,0 +1,44 @@
+dataset:
+  value: "fluids.MultiObstacleIncompressibleMultiFrame"
+data_path:
+  value: "PyFR"
+file_prefix:
+  value: "data_"
+file_count:
+  value: 1
+image_size:
+  value: 64
+num_trajectories:
+  value: 2200
+max_traj_per_file:
+  value: 2200
+model_name:
+  value: "T"
+lr:
+  value: 0.001
+lr_embedding_recovery:
+  value: 0.001
+lr_time_embedding:
+  value: 0.001
+weight_decay:
+  value: 0.01
+lr_scheduler:
+  value: "cosine"
+warmup_ratio:
+  value: 0.0
+early_stopping_patience:
+  value: 0
+num_epochs:
+  value: 10000000000
+batch_size:
+  value: 100
+max_grad_norm:
+  value: 5.0
+eta_step_time:
+  value: 0.048
+per_data_generation_time:
+  value: 193.5667
+per_data_downsample_time:
+  value: 0
+eval_ndata:
+  value: 100
