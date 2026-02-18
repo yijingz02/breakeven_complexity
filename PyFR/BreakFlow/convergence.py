@@ -1,3 +1,4 @@
+import os
 from glob import glob
 from operator import itemgetter
 import h5py
