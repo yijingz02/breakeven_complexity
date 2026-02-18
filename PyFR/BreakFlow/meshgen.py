@@ -35,12 +35,11 @@ class RectangleMeshGenerator:
         self.domain_bounds = domain_bounds or {'x': [0, 50], 'y': [-25, 25]}
         self.refinement_zone = refinement_zone or {'x': [5, 45], 'y': [-20, 20]}
         
-        # Mesh resolution parameters
+        # Mesh parameters
         self.coarse_size = 2.0
         self.fine_size = 0.5
         self.obstacle_size = 0.2
-        
-        # Grading control parameters
+        self.mesh_order = 1
         self.grading_dist_min = 0.5  # Distance where grading starts
         self.grading_dist_max = 5.0  # Distance where max size is reached
         
@@ -75,6 +74,9 @@ class RectangleMeshGenerator:
             'height': height,
             'rotation': rotation
         })
+
+    def set_mesh_order(self, mesh_order=1):
+        self.mesh_order = mesh_order
         
     def set_mesh_resolution(self, coarse_size=None, fine_size=None, obstacle_size=None,
                            grading_dist_min=None, grading_dist_max=None):
@@ -282,6 +284,9 @@ class RectangleMeshGenerator:
         
         # Remove duplicate nodes to ensure clean mesh
         gmsh.model.mesh.removeDuplicateNodes()
+
+        # Set mesh order
+        gmsh.model.mesh.setOrder(self.mesh_order)
 
         # Set mesh format to 2.2 (more widely supported)
         gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
@@ -584,14 +589,21 @@ def remove_overlaps_and_mirror(rectangles, max_area=60.0, min_dist=2.0, xlim=(10
     return non_overlapping + mirrored
 
 
-def random_rectangle_mesh(output="mesh.msh", seed=None, max_area=60.0, min_dist=2, plot_mesh=False):
+def random_rectangle_mesh(output="mesh.msh", 
+                          seed=None, 
+                          centerline=False,
+                          mesh_order=1, 
+                          coarse_size=1.0, 
+                          max_area=60.0, 
+                          min_dist=2, 
+                          plot_mesh=False):
 
     random.seed(seed)
     rectangles = []
     data = {'seed': seed, 'parameters': {}}
 
     for center_x in range(11, 25, min_dist):
-        for center_y in range(0, 15, min_dist):
+        for center_y in range(0 if centerline else min_dist, 15, min_dist):
             on = random.randint(0, 1)
             area = random.randint(4, int(max_area / 2) if center_y else int(max_area))
             if random.randint(0, 1):
@@ -623,24 +635,26 @@ def random_rectangle_mesh(output="mesh.msh", seed=None, max_area=60.0, min_dist=
     with open(datafile, 'w') as f:
         json.dump(data, f)
     
-    # Create mesh generator
-    generator = RectangleMeshGenerator(
-                                       {'x': [0, 50], 'y': [-25, 25]},
-                                       {'x': [5, 45], 'y': [-20, 20]},
-                                       )
-    
-    # Set mesh resolution
-    generator.set_mesh_resolution(coarse_size=1/np.sqrt(2.0), fine_size=np.sqrt(2.0)/3, obstacle_size=np.sqrt(2.0)/6)
-    #generator.set_mesh_resolution(coarse_size=1, fine_size=2/3, obstacle_size=1/3)
-    
-    # Add rectangular obstacles
+    # Generate mesh
+    generator = RectangleMeshGenerator()
+    generator.set_mesh_resolution(coarse_size=coarse_size, fine_size=2.0*coarse_size/3.0, obstacle_size=coarse_size/3.0)
+    generator.set_mesh_order(mesh_order=mesh_order)
     for rect in rectangles:
         generator.add_rectangle(*rect)
-    
-    # Generate mesh
     generator.generate_mesh(output)
     
     # Plot mesh
+    if plot_mesh:
+        generator.plot_mesh(output)
+
+
+def square_test_mesh(output="mesh.msh", mesh_order=1, coarse_size=1.0, size=3.0, plot_mesh=False):
+
+    generator = RectangleMeshGenerator()
+    generator.set_mesh_resolution(coarse_size=coarse_size, fine_size=2.0*coarse_size/3.0, obstacle_size=coarse_size/3.0)
+    generator.set_mesh_order(mesh_order=mesh_order)
+    generator.add_rectangle(10, 0, size, size, 45)
+    generator.generate_mesh(output)
     if plot_mesh:
         generator.plot_mesh(output)
 

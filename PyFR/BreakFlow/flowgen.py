@@ -1,10 +1,9 @@
-import sys
+from argparse import ArgumentParser
 from collections import defaultdict
 from glob import glob
 from operator import itemgetter
 import h5py
-import numpy as np
-import pyvista as pv
+import numpy as np; np.seterr(all='raise')
 from matplotlib.animation import FuncAnimation
 from matplotlib import pyplot as plt
 from paraview.simple import Calculator, Gradient, ResampleToImage, XMLUnstructuredGridReader, servermanager
@@ -91,7 +90,6 @@ def array2gif(array, output_path='animation.gif', fps=10, dpi=100, clip=False):
     print(f"Animation saved to {output_path}")
 
 
-
 def vtu2D(vpath, n):
     """
     Interpolate 2D triangle mesh data from VTU file onto a regular grid.
@@ -107,16 +105,14 @@ def vtu2D(vpath, n):
     dict
     """
 
-    mesh = pv.read(vpath)
-    points = np.array(mesh.points)
-    x = points[:, 0]
-    y = points[:, 1]
-    
-    x_min, x_max = x.min(), x.max()
+
+    reader = XMLUnstructuredGridReader(FileName=vpath)
+    reader.UpdatePipeline()
+
+    bounds = reader.GetDataInformation().GetBounds()
+    x_min, x_max, y_min, y_max = bounds[0], bounds[1], bounds[2], bounds[3]
     dx = x_max - x_min
-    y_min, y_max = y.min(), y.max()
     dy = y_max - y_min
-    
     if dx > dy:
         nx = n
         ny = int(np.ceil(dy/dx * n))
@@ -124,18 +120,16 @@ def vtu2D(vpath, n):
         nx = int(np.ceil(dx/dy * n))
         ny = n
 
-    resampleToImage = ResampleToImage(Input=XMLUnstructuredGridReader(FileName=vpath))
+    resampleToImage = ResampleToImage(Input=reader)
     resampleToImage.SamplingDimensions = [nx, ny, 1]
-
-    # resampleToImage.UseInputBounds = 1
     resampleToImage.SamplingBounds = [x_min, x_max, y_min, y_max, 0.0, 0.0]
-
     resampleToImage.UpdatePipeline()
 
     calculator = Calculator(Input=resampleToImage)
     calculator.ResultArrayName = 'Velocity3D'
     calculator.Function = 'Velocity_X*iHat + Velocity_Y*jHat + 0*kHat'
     calculator.UpdatePipeline()
+
     gradientFilter = Gradient(Input=calculator)
     gradientFilter.ScalarArray = ['POINTS', 'Velocity3D']
     gradientFilter.ComputeVorticity = 1
@@ -161,31 +155,63 @@ def vtu2D(vpath, n):
                     output[f'{key}_{d}'] = np.array(value[:,i], dtype=dtype).reshape(nx, ny) #Velocity
         else:
             output[key] = np.array(value, dtype=dtype).reshape(nx, ny)                       #Pressure
+
     return output
 
 
-if __name__ == '__main__':
+def get_structured_data(folder, resolution=64, dump_gif=False):
 
     data = defaultdict(lambda: [])
-    for vpath, t in sorted(((path, float(path.rsplit('.', 1)[0].rsplit('-', 1)[1])) for path in glob('*.vtu')), key=itemgetter(1)):
+    output = {'errors': []}
+    for vpath, t in sorted(((path, float(path.rsplit('.', 1)[0].rsplit('-', 1)[1])) for path in glob(f'{folder}/*.vtu')), key=itemgetter(1)):
         print('Processing timestep', t, end='\r')
-        # for key, value in vtu2D(vpath, int(sys.argv[1]) if sys.argv[1:] else 256).items():
-        for key, value in vtu2D(vpath, int(sys.argv[1]) if sys.argv[1:] else 64).items():
+        tdata = {}
+        for attempt in range(100): # rarely needs >3 attempts...
+            err = ''
+            try:
+                tdata = vtu2D(vpath, resolution)
+                if any(np.isnan(value).any() for value in tdata.values()):
+                    err = 'NaNs'
+                else:
+                    break
+            except FloatingPointError:
+                err = 'ParaView'
+            if err:
+                print('Attempt', attempt+1, 'error:', err)
+            else:
+                break
+        else:
+            print('Processing', vpath, 'failed after', attempt+1, 'attempts')
+
+        output['errors'].append(err)
+        for key, value in tdata.items():
             if key == 'Mask':
                 mask = value
             else:
                 data[key.lower()].append(value)
 
-    output = {'mask': mask}
+    output['mask'] = mask
     with h5py.File(vpath.replace('.vtu', '.pyfrs'), 'r') as f:
         output['wallclock'] = float(str(f['stats'][()]).split('\\nwall-time = ', 1)[1].rsplit('\\nplugin-wall-time-common', 1)[0])
     for key, value in data.items():
         output[key] = np.stack(value)
-        if sys.argv[2:]:
-            array2gif(output[key], output_path=f'{key}.gif')
+        if dump_gif:
+            array2gif(output[key]*mask, output_path=f'{folder}/{key}.gif')
 
-    with h5py.File('flow.h5', 'w') as f:
+    with h5py.File(f'{folder}/flow.h5', 'w') as f:
         for key, value in output.items():
             f.create_dataset(key, data=value)
 
     print(f"Flow data saved to flow.h5")
+    return output
+
+
+if __name__ == '__main__':
+
+    parser = ArgumentParser()
+    parser.add_argument('folder')
+    parser.add_argument('--resolution', type=int)
+    parser.add_argument('--dump-gif', action='store_true')
+    args = parser.parse_args()
+
+    get_structured_data(args.folder, resolution=args.resolution, dump_gif=args.dump_gif)
