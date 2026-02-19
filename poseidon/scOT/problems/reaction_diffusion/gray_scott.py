@@ -78,7 +78,7 @@ class GrayScottMultiFile(BaseTimeDataset):
         self.constants = {
             "mean": torch.tensor([0.5679058974330023, 0.1474146956766236]),
             "std": torch.tensor([0.19865445303638865, 0.10964190679427516]),
-            "time": 10.0,
+            "time": 10.0, 
         }
 
         self.post_init()
