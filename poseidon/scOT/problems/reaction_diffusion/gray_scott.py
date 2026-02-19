@@ -76,8 +76,8 @@ class GrayScottMultiFile(BaseTimeDataset):
         self.pixel_mask = torch.tensor([False, False])
         
         self.constants = {
-            "mean": torch.tensor([0.0, 0.0]),
-            "std": torch.tensor([1.0, 1.0]),
+            "mean": torch.tensor([0.5679058974330023, 0.1474146956766236]),
+            "std": torch.tensor([0.19865445303638865, 0.10964190679427516]),
             "time": 10.0,
         }
 
