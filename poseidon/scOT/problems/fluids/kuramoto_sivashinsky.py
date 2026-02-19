@@ -70,8 +70,8 @@ class KuramotoSivashinskyMultiFile(BaseTimeDataset):
         self.pixel_mask = torch.tensor([False])
         
         self.constants = {
-            "mean": torch.tensor([0.0]),
-            "std": torch.tensor([1.0]),
+            "mean": torch.tensor([-4.86998020605256e-10]),
+            "std": torch.tensor([3.065352676231989]),
             "time": 1.0,
         }
 
