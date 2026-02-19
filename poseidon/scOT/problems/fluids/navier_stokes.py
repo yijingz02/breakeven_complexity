@@ -70,8 +70,8 @@ class NavierStokesMultiFile(BaseTimeDataset):
         self.pixel_mask = torch.tensor([False])
         
         self.constants = {
-            "mean": torch.tensor([0.0]),
-            "std": torch.tensor([1.0]),
+            "mean": torch.tensor([-2.9261311139783255e-10]),
+            "std": torch.tensor([0.26406050778680523]),
             "time": 1.0,
         }
 
