@@ -10,7 +10,7 @@ def generate(folder,
              test_mesh=False,           # use a single square obstacle 
              coarse_size=1.0,           # also scales fine_size & obstacle_size
              dts=(0.05, 0.04, 0.03),    # base timesteps to try
-             tend=100.0,
+             iniswap={},                # parameters to change in .ini file
              dt_out=5.0, 
              resolution=64, 
              dump_gif=False, 
@@ -34,10 +34,10 @@ def generate(folder,
             dt = dt_out / int(dt_out / (dt_base*coarse_size))
             cfgswap = {'dt': dt,
                        'pseudo-dt': dt/10.0,
-                       'tend': tend,
                        'dt-out': dt_out,
                        'file': csvfile,
                        'basedir': folder}
+            cfgswap.update(iniswap)
             with open(config, 'r') as f:
                 with open(inifile, 'w') as g:
                     for line in f:
@@ -79,20 +79,21 @@ def generate(folder,
 
 if __name__ == '__main__':
 
-#    for coarse_size in [2.0, 1.7, 1.4, 1.2, 1.0, 0.85]:
-#        generate(f'long_{str(coarse_size).replace(".", "p")}', 
-#                 config='inc-flow.ini',
-#                 seed=0,
-#                 coarse_size=coarse_size, 
-#                 tend=1000.0,
-#                 resolution=256, 
-#                 dump_gif=True)
+    for coarse_size in [2.0, 1.7, 1.4, 1.2, 1.0]:
+        generate(f'long_{str(coarse_size).replace(".", "p")}', 
+                 config='inc-flow.ini',
+                 seed=0,
+                 coarse_size=coarse_size, 
+                 iniswap={'tend': 1000.0},
+                 resolution=256, 
+                 dump_gif=True)
 
     for coarse_size in [2.0, 1.7, 1.4, 1.2, 1.0, 0.85, 0.7, 0.5, 0.35, 0.25]:
         generate(f'lowRe_{str(coarse_size).replace(".", "p")}', 
-                 config='inc-flow-lowRe.ini',
+                 config='inc-flow.ini',
                  seed=0,
                  coarse_size=coarse_size, 
-                 dts=(0.07, 0.06, 0.5),
+                 dts=(0.07, 0.06, 0.05, 0.04),
+                 iniswap={'nu': 0.01},
                  resolution=256, 
                  dump_gif=True)

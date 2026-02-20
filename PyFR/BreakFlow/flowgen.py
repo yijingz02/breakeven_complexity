@@ -9,6 +9,24 @@ from matplotlib import pyplot as plt
 from paraview.simple import Calculator, Gradient, ResampleToImage, XMLUnstructuredGridReader, servermanager
 
 
+def array2png(array, output_path='heatmap.png', dpi=100):
+
+    vmin = array.min()
+    vmax = array.max()
+    if vmin >= 0.0:
+        vmin = 0.0
+        cmap = 'cool'
+    else:
+        vmax = max(vmax, -vmin)
+        vmin = -vmax
+        cmap = 'seismic'
+
+    img = plt.imshow(array, cmap=cmap, vmin=vmin, vmax=vmax)
+    plt.colorbar(img)
+    plt.savefig(output_path, dpi=dpi)
+    plt.clf()
+
+
 def array2gif(array, output_path='animation.gif', fps=10, dpi=100, clip=False):
     """
     Convert a 3D numpy array to a gif animation.
