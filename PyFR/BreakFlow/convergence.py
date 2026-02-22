@@ -7,9 +7,9 @@ from matplotlib import pyplot as plt
 from flowgen import array2png
 
 
-root = 'long_'
+root = 'lowRe_'
 sims = sorted(((folder, float(folder[len(root):].replace('p', '.')))
-    for folder in glob(f'{root}*')), key=itemgetter(1))[1:]
+    for folder in glob(f'{root}*')), key=itemgetter(1))
 
 stats = {'velocities': [], 'avg-velo': [], 'enstrophy': [], 'vorticity': [], 'avg-vort': []}
 overtime = {'velocities': [], 'avg-velo': [], 'enstrophy': [], 'vorticity': [], 'avg-vort': []}
