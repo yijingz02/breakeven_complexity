@@ -132,7 +132,7 @@ class RectangleMeshGenerator:
         
         return corners
     
-    def generate_mesh(self, output_file='mesh.msh'):
+    def generate_mesh(self, output_file='mesh.msh', verbosity=2):
         """
         Generate the mesh with Gmsh.
         
@@ -140,6 +140,8 @@ class RectangleMeshGenerator:
         -----------
         output_file : str, optional
             Output mesh filename (default: 'mesh.msh')
+        verbosity : int, optional
+            gmsh verbosity (0: none, 1: most, 2: default)
         """
         gmsh.initialize()
         gmsh.model.add("rectangle_flow")
@@ -206,9 +208,6 @@ class RectangleMeshGenerator:
         
         # Synchronize
         gmsh.model.geo.synchronize()
-        
-        # DON'T embed curves - PyFR sees embedded 1D elements as unpaired faces!
-        # We'll use Box field instead for refinement zone sizing
         
         # Set Gmsh meshing options for better control
         gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 1)  # Allow boundary sizes to extend
@@ -280,6 +279,7 @@ class RectangleMeshGenerator:
             gmsh.model.mesh.field.setAsBackgroundMesh(1)
         
         # Generate 2D mesh
+        gmsh.option.setNumber("General.Terminal", verbosity)
         gmsh.model.mesh.generate(2)
         
         # Remove duplicate nodes to ensure clean mesh
@@ -302,13 +302,14 @@ class RectangleMeshGenerator:
         
         gmsh.finalize()
         
-        print(f"Mesh generated successfully: {output_file}")
-        print(f"  Domain: x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]")
-        print(f"  Refinement zone: x=[{rx_min}, {rx_max}], y=[{ry_min}, {ry_max}]")
-        print(f"  Number of obstacles: {len(self.rectangles)}")
-        print(f"  Nodes: {len(node_tags)}")
-        print(f"  Elements: {sum(len(tags) for tags in element_tags)}")
-    
+        if verbosity:
+            print(f"Mesh generated successfully: {output_file}")
+            print(f"  Domain: x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]")
+            print(f"  Refinement zone: x=[{rx_min}, {rx_max}], y=[{ry_min}, {ry_max}]")
+            print(f"  Number of obstacles: {len(self.rectangles)}")
+            print(f"  Nodes: {len(node_tags)}")
+            print(f"  Elements: {sum(len(tags) for tags in element_tags)}")
+        
     def validate_mesh(self, mesh_file):
         """
         Validate mesh integrity and check for common issues.
@@ -595,8 +596,9 @@ def random_rectangle_mesh(output="mesh.msh",
                           mesh_order=1, 
                           coarse_size=1.0, 
                           max_area=60.0, 
-                          min_dist=2, 
-                          plot_mesh=False):
+                          min_dist=2,
+                          plot_mesh=False,
+                          **kwargs):
 
     random.seed(seed)
     rectangles = []
@@ -641,20 +643,25 @@ def random_rectangle_mesh(output="mesh.msh",
     generator.set_mesh_order(mesh_order=mesh_order)
     for rect in rectangles:
         generator.add_rectangle(*rect)
-    generator.generate_mesh(output)
+    generator.generate_mesh(output, **kwargs)
     
     # Plot mesh
     if plot_mesh:
         generator.plot_mesh(output)
 
 
-def square_test_mesh(output="mesh.msh", mesh_order=1, coarse_size=1.0, size=3.0, plot_mesh=False):
+def square_test_mesh(output="mesh.msh", 
+                     mesh_order=1, 
+                     coarse_size=1.0, 
+                     size=3.0, 
+                     plot_mesh=False,
+                     **kwargs):
 
     generator = RectangleMeshGenerator()
     generator.set_mesh_resolution(coarse_size=coarse_size, fine_size=2.0*coarse_size/3.0, obstacle_size=coarse_size/3.0)
     generator.set_mesh_order(mesh_order=mesh_order)
     generator.add_rectangle(10, 0, size, size, 45)
-    generator.generate_mesh(output)
+    generator.generate_mesh(output, **kwargs)
     if plot_mesh:
         generator.plot_mesh(output)
 

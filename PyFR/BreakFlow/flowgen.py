@@ -209,8 +209,6 @@ def get_structured_data(folder, resolution=64, dump_gif=False):
                 data[key.lower()].append(value)
 
     output['mask'] = mask
-    with h5py.File(vpath.replace('.vtu', '.pyfrs'), 'r') as f:
-        output['wallclock'] = float(str(f['stats'][()]).split('\\nwall-time = ', 1)[1].rsplit('\\nplugin-wall-time-common', 1)[0])
     for key, value in data.items():
         output[key] = np.stack(value)
         if dump_gif:
