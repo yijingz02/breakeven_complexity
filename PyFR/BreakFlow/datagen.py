@@ -11,14 +11,14 @@ from meshgen import random_rectangle_mesh, square_test_mesh
 def actual_dt_out_matches_expected(tstart, tend, dt, dt_out, dt_min=1e-12, rounding=2):
 
     expected = []
-    tcurr = 0.0
+    tcurr = tstart
     while tcurr <= tend:
         expected.append(tcurr)
         tcurr += dt_out
 
-    actual = [0.0]
-    tcurr = 0.0
-    tout_last = 0.0
+    actual = [tstart]
+    tcurr = tstart
+    tout_last = tstart
     tol = 5 * dt_min
     while tcurr <= tend:
         tcurr += dt
