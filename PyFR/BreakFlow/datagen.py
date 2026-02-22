@@ -36,7 +36,8 @@ def generate(folder,
              dt_step=0.01,              # amount to reduce base dt by if NaNs
              dt_min=0.01,               # smallest base dt to try
              iniswap=[],                # parameters to change in .ini file
-             resolution=64, 
+             resolution=64,             # structured data resolution
+             verbose=False,
              progress_bar=False,
              dump_gif=False, 
              **kwargs):
@@ -58,8 +59,8 @@ def generate(folder,
 
     wallclock = -perf_counter()
     meshgen = square_test_mesh if test_mesh else random_rectangle_mesh
-    meshgen(output=mshfile, coarse_size=coarse_size, **kwargs)          # pass seed via kwargs
-    subprocess.run(['pyfr', 'import', mshfile, pyfrmfile], check=True)  # converts to PyFR mesh
+    meshgen(output=mshfile, coarse_size=coarse_size, verbosity=2 if verbose else 0, **kwargs)   # pass seed via kwargs
+    subprocess.run(['pyfr', 'import', mshfile, pyfrmfile], check=True)                          # converts to PyFR mesh
 
     pyfrcommand = ['pyfr']
     if progress_bar:
@@ -70,7 +71,7 @@ def generate(folder,
 
         try:
             denom = int(dt_out / (dt_base * coarse_size))
-            while True:                         # figures out largest viable dt
+            while True: # figures out largest viable dt
                 dt = dt_out / denom
                 if actual_dt_out_matches_expected(tstart, tend, dt, dt_out):
                     break
@@ -81,8 +82,9 @@ def generate(folder,
                 f.write(cfg.tostr())
             subprocess.run(pyfrcommand + meshsolncfg, check=True)
             break
-
-        except subprocess.CalledProcessError:   # figures out last timestep without NaNs and restarts
+        
+        # figures out last timestep without NaNs and restarts
+        except subprocess.CalledProcessError:               
             dt_base -= dt_step
             if dt_base < dt_min:
                 raise
@@ -107,7 +109,12 @@ def generate(folder,
         subprocess.run(['pyfr', 'export', pyfrmfile, pyfrsfile, f'{pyfrsfile[:-6]}.vtu'])
 
     # runs Python code in a subprocess to avoid non-deterministic ParaView errors...
-    subprocess.run(['python', 'flowgen.py', folder, '--resolution', str(resolution)] + ['--dump-gif'] if dump_gif else [])
+    flowgen = ['python', 'flowgen.py', folder, '--resolution', str(resolution)]
+    if dump_gif:
+        flowgen.append('--dump-gif')
+    if verbose:
+        flowgen.append('--verbose')
+    subprocess.run(flowgen)
     for vtufile in glob(f'{folder}/*.vtu'):
         os.remove(vtufile)
 
@@ -124,7 +131,7 @@ if __name__ == '__main__':
                  coarse_size=coarse_size, 
                  iniswap=[('solver-time-integrator', 'tend', 1000.0)],
                  resolution=256, 
-                 verbosity=2,
+                 verbose=True,
                  progress_bar=True,
                  dump_gif=True)
 
@@ -136,6 +143,6 @@ if __name__ == '__main__':
                  iniswap=[('constants', 'nu', 0.01), 
                           ('solver-time-integrator', 'dt', 0.07)],
                  resolution=256, 
-                 verbosity=2,
+                 verbose=True,
                  progress_bar=True,
                  dump_gif=True)

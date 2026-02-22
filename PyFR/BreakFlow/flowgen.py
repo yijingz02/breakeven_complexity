@@ -27,7 +27,7 @@ def array2png(array, output_path='heatmap.png', dpi=100):
     plt.clf()
 
 
-def array2gif(array, output_path='animation.gif', fps=10, dpi=100, clip=False):
+def array2gif(array, output_path='animation.gif', fps=10, dpi=100):
     """
     Convert a 3D numpy array to a gif animation.
 
@@ -41,8 +41,6 @@ def array2gif(array, output_path='animation.gif', fps=10, dpi=100, clip=False):
         Frames per second in the output animation, default is 10
     dpi : int, optional
         Resolution of the output gif, default is 100
-    clip : bool, optional
-        Whether to clip values outside 3 standard deviations, default False
 
     Returns:
     --------
@@ -51,13 +49,6 @@ def array2gif(array, output_path='animation.gif', fps=10, dpi=100, clip=False):
     # Validate input dimensions
     if len(array.shape) != 3:
         raise ValueError(f"Expected 3D array with shape (T, height, width), got shape {array.shape}")
-
-    # Clip array
-    if clip:
-        std = array.std()
-        nclip = (np.absolute(array) > 3.0*std).sum()
-        print(f"Clipped {nclip} / {int(np.prod(array.shape))} values")
-        array = np.clip(array, -3.0*std, 3.0*std)
 
     # Get number of frames
     num_frames = array.shape[0]
@@ -104,8 +95,6 @@ def array2gif(array, output_path='animation.gif', fps=10, dpi=100, clip=False):
 
     # Close the figure to free memory
     plt.close(fig)
-
-    print(f"Animation saved to {output_path}")
 
 
 def vtu2D(vpath, n):
@@ -177,12 +166,13 @@ def vtu2D(vpath, n):
     return output
 
 
-def get_structured_data(folder, resolution=64, dump_gif=False):
+def get_structured_data(folder, resolution=64, dump_gif=False, verbose=False):
 
     data = defaultdict(lambda: [])
     output = {'errors': []}
     for vpath, t in sorted(((path, float(path.rsplit('.', 1)[0].rsplit('-', 1)[1])) for path in glob(f'{folder}/*.vtu')), key=itemgetter(1)):
-        print('Processing timestep', t, end='\r')
+        if verbose:
+            print('Processing timestep', t, end='\r')
         tdata = {}
         for attempt in range(100): # rarely needs >3 attempts...
             err = ''
@@ -195,7 +185,8 @@ def get_structured_data(folder, resolution=64, dump_gif=False):
             except FloatingPointError:
                 err = 'ParaView'
             if err:
-                print('Attempt', attempt+1, 'error:', err)
+                if verbose:
+                    print('Attempt', attempt+1, 'error:', err)
             else:
                 break
         else:
@@ -213,12 +204,15 @@ def get_structured_data(folder, resolution=64, dump_gif=False):
         output[key] = np.stack(value)
         if dump_gif:
             array2gif(output[key]*mask, output_path=f'{folder}/{key}.gif')
+            if verbose:
+                print(f'Animation saved to {folder}/{key}.gif')
 
     with h5py.File(f'{folder}/flow.h5', 'w') as f:
         for key, value in output.items():
             f.create_dataset(key, data=value)
+    if verbose:
+        print(f"Flow data saved to flow.h5")
 
-    print(f"Flow data saved to flow.h5")
     return output
 
 
@@ -228,6 +222,7 @@ if __name__ == '__main__':
     parser.add_argument('folder')
     parser.add_argument('--resolution', type=int)
     parser.add_argument('--dump-gif', action='store_true')
+    parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
 
-    get_structured_data(args.folder, resolution=args.resolution, dump_gif=args.dump_gif)
+    get_structured_data(args.folder, resolution=args.resolution, dump_gif=args.dump_gif, verbose=args.verbose)
