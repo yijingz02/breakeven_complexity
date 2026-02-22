@@ -134,7 +134,7 @@ if __name__ == '__main__':
                  seed=0,
                  coarse_size=coarse_size, 
                  iniswap=[('constants', 'nu', 0.01), 
-                          ('solver-time-integrator', 'dt', 0.085)],
+                          ('solver-time-integrator', 'dt', 0.07)],
                  resolution=256, 
                  verbosity=2,
                  progress_bar=True,
