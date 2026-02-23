@@ -166,7 +166,11 @@ def vtu2D(vpath, n):
     return output
 
 
-def get_structured_data(folder, resolution=64, dump_gif=False, verbose=False):
+def get_structured_data(folder, 
+                        resolution=64, 
+                        quantities={'pressure', 'velocity_x', 'velocity_y', 'vorticity'}, 
+                        dump_gif=False, 
+                        verbose=False):
 
     data = defaultdict(lambda: [])
     output = {'errors': []}
@@ -196,7 +200,7 @@ def get_structured_data(folder, resolution=64, dump_gif=False, verbose=False):
         for key, value in tdata.items():
             if key == 'Mask':
                 mask = value
-            else:
+            elif key.lower() in quantities:
                 data[key.lower()].append(value)
 
     output['mask'] = mask
