@@ -328,7 +328,7 @@ t1 = time.time()
 
 S = args.grid
 T_in = 5
-T = 50 - T_in
+T = 50 - 1
 T_eval = 999
 step = 1
 
@@ -340,8 +340,12 @@ def load_data(file_index, n):
     u = np.load(args.data_path + f"data_{file_index}_u.npy", mmap_mode="r+")
     fields_u = torch.from_numpy(u).float()
 
-    train_x = fields_u[:n,::sub,::sub,:T_in]
-    train_y = fields_u[:n,::sub,::sub,T_in:T+T_in]
+    padding = fields_u[:n, ::sub, ::sub, 0:1].repeat(1, 1, 1, T_in)
+    full_seq = torch.cat([padding, fields_u[:n, ::sub, ::sub, :]], dim=-1)
+    
+    train_x = full_seq[..., :T_in] 
+    train_y = full_seq[..., T_in + 1:]
+    
     train_x = train_x.reshape(n, S//sub, S//sub, T_in, 1)
     train_y = train_y.reshape(n, S//sub, S//sub, T, 1)
 
