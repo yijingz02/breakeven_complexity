@@ -341,7 +341,7 @@ t1 = time.time()
 
 S = args.grid
 T_in = args.condition_frame
-T = args.total_frame - args.condition_frame
+T = args.total_frame - 1
 T_eval = 999
 step = 1
 
@@ -356,22 +356,21 @@ def load_data(file_index, n):
     fields_u = torch.from_numpy(u).float()
     fields_v = torch.from_numpy(v).float()
 
-    train_x_u = fields_u[:n,::sub,::sub,:T_in]
-    train_x_v = fields_v[:n,::sub,::sub,:T_in]
-
-    # print(type(train_x_u))
-
+    first_u = fields_u[:n, ::sub, ::sub, 0:1]
+    first_v = fields_v[:n, ::sub, ::sub, 0:1]
+    
+    train_x_u = first_u.repeat(1, 1, 1, T_in)
+    train_x_v = first_v.repeat(1, 1, 1, T_in)
     train_x = torch.stack([train_x_u, train_x_v], dim=-1)
 
-    train_y_u = fields_u[:n,::sub,::sub,T_in:T+T_in]
-    train_y_v = fields_v[:n,::sub,::sub,T_in:T+T_in]
+    train_y_u = fields_u[:n, ::sub, ::sub, 1:]
+    train_y_v = fields_v[:n, ::sub, ::sub, 1:]
     train_y = torch.stack([train_y_u, train_y_v], dim=-1)
 
+    current_T_pred = train_y.shape[-2]
+    
     train_x = train_x.reshape(n, S//sub, S//sub, T_in, 2)
-    train_y = train_y.reshape(n, S//sub, S//sub, T, 2)
-
-    # print("data x size:", train_x.shape)
-    # print("data x device", train_x.device)
+    train_y = train_y.reshape(n, S//sub, S//sub, current_T_pred, 2)
 
     if file_index == "val":
         train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_x, train_y), batch_size=100, shuffle=False)
@@ -659,8 +658,9 @@ with torch.no_grad():
     for xx, yy in val_loader:
         B = xx.shape[0]
 
-        window = xx[..., :T_in, :]     # CPU: (B,S,S,T_in,2)
-
+        # window = xx[..., :T_in, :]     # CPU: (B,S,S,T_in,2)
+        window = xx[..., 0:1, :].repeat(1, 1, 1, T_in, 1)
+        
         preds_list = []
         for t in range(T):
             inp = window.flatten(start_dim=-2).contiguous().to(device, non_blocking=True)
