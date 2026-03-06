@@ -1,0 +1,20 @@
+# Multi-obstacle example config
+ndata: 1000
+ntest: 100
+budget: 100
+per_step_time: 0.41
+per_data_generation_time: 180
+reduced_resolution: 1
+reduced_resolution_t: 1
+grid: 64
+T_in: 5
+T_total: 21
+modes: 16
+width: 64
+n_layers: 24
+batch_size: 16
+data_path: .
+save: output_mo
+mode: full
+use_fork: false
+noise_std: 0.01
