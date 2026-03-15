@@ -1,3 +1,4 @@
+import math
 import os
 import subprocess
 from glob import glob
@@ -45,11 +46,12 @@ def generate(folder,
     mshfile = f'{folder}/mesh.msh'
     pyfrmfile = f'{folder}/mesh.pyfrm'
     inifile = f'{folder}/cfg.ini'
+    resfile = f'{folder}/residual.csv'
     os.makedirs(folder, exist_ok=True)
 
     cfg = Inifile.load(config)
     cfg.set('soln-plugin-writer', 'basedir', folder)
-    cfg.set('soln-plugin-pseudostats', 'file', f'{folder}/residual.csv')
+    cfg.set('soln-plugin-pseudostats', 'file', resfile)
     for section, option, value in iniswap:
         cfg.set(section, option, value)
     tstart = cfg.getfloat('solver-time-integrator', 'tstart')
@@ -92,14 +94,16 @@ def generate(folder,
             pyfrsfiles = sorted(((pyfrsfile, float(pyfrsfile[:-6].rsplit('.', 1)[0].rsplit('-', 1)[1]))
                                  for pyfrsfile in glob(f'{folder}/*.pyfrs')),
                                  key=itemgetter(1))
-            with open(config, 'r') as f:
-                for line in f:
-                    if line[:9] == 'nsteps = ':
-                        nsteps = int(line[9:])
-                        break
-            last = (int(pyfrsfiles[-1][1] / (dt * nsteps))+1) * dt * nsteps
+            last = 0.0
+            if os.path.isfile(resfile):
+                with open(resfile, 'r') as f:
+                    f.readline()
+                    for line in f:
+                        split = line.split(',')
+                        if not any(e == 'nan' for e in split[-3:]):
+                            last = float(split[1])
             for pyfrsfile, t in reversed(pyfrsfiles):
-                if t <= last - dt * nsteps:
+                if t <= last + 0.1 * dt:
                     break
             meshsolncfg = [pyfrmfile, pyfrsfile, inifile]
 
@@ -124,25 +128,16 @@ def generate(folder,
 
 if __name__ == '__main__':
 
-    for coarse_size in [2.0, 1.7, 1.4, 1.2, 1.0, 0.85, 0.7]:
-        generate(f'long_{str(coarse_size).replace(".", "p")}', 
-                 config='inc-flow.ini',
-                 seed=0,
-                 coarse_size=coarse_size, 
-                 iniswap=[('solver-time-integrator', 'tend', 1000.0)],
-                 resolution=256, 
-                 verbose=True,
-                 progress_bar=True,
-                 dump_gif=True)
-
-    for coarse_size in [2.0, 1.7, 1.4, 1.2, 1.0, 0.85, 0.7, 0.5, 0.35, 0.25]:
-        generate(f'lowRe_{str(coarse_size).replace(".", "p")}', 
-                 config='inc-flow.ini',
-                 seed=0,
-                 coarse_size=coarse_size, 
-                 iniswap=[('constants', 'nu', 0.01), 
-                          ('solver-time-integrator', 'dt', 0.07)],
-                 resolution=256, 
-                 verbose=True,
-                 progress_bar=True,
-                 dump_gif=True)
+    coarse_size = 1.0
+    seed = 0
+    generate(f'{seed}', 
+             config='inc-flow.ini',
+             seed=seed,
+             coarse_size=coarse_size, 
+             iniswap=[('backend', 'precision', 'single'),
+                      ('constants', 'nu', 0.01), 
+                      ('solver-time-integrator', 'dt', 0.07)],
+             resolution=64, 
+             verbose=True,
+             progress_bar=True,
+             dump_gif=True)
