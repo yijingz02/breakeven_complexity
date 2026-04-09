@@ -527,6 +527,20 @@ class RectangleMeshGenerator:
         
         return nodes, elements
 
+    def minimum_edge_length(self, mesh_file):
+        """Calculate the minimum edge length in the mesh."""
+
+        nodes, elements = self._read_gmsh_mesh(mesh_file)
+        min_length = float('inf')
+        
+        for elem in elements:
+            for i in range(len(elem)):
+                p1 = nodes[elem[i]]
+                p2 = nodes[elem[(i + 1) % len(elem)]]
+                edge_length = np.linalg.norm(p2 - p1)
+                min_length = min(min_length, edge_length)
+        return min_length
+
 
 def create_polygon(center_x, center_y, width, height, rotation):
     """Create a polygon from rectangle parameters."""
@@ -633,7 +647,7 @@ def random_rectangle_mesh(output="mesh.msh",
     if os.path.isfile(output):
         with open(datafile, 'r') as f:
             if data == json.load(f):
-                return
+                return RectangleMeshGenerator().minimum_edge_length(output)
     with open(datafile, 'w') as f:
         json.dump(data, f)
     
@@ -648,6 +662,8 @@ def random_rectangle_mesh(output="mesh.msh",
     # Plot mesh
     if plot_mesh:
         generator.plot_mesh(output)
+
+    return generator.minimum_edge_length(output)
 
 
 def square_test_mesh(output="mesh.msh", 
@@ -664,6 +680,8 @@ def square_test_mesh(output="mesh.msh",
     generator.generate_mesh(output, **kwargs)
     if plot_mesh:
         generator.plot_mesh(output)
+
+    return generator.minimum_edge_length(output)
 
 
 if __name__ == "__main__":

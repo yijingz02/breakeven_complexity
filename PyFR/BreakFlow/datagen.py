@@ -35,7 +35,6 @@ def generate(folder,
              test_mesh=False,           # use a single square obstacle 
              coarse_size=1.0,           # also scales fine_size & obstacle_size
              dt_step=0.01,              # amount to reduce base dt by if NaNs
-             dt_min=0.01,               # smallest base dt to try
              iniswap=[],                # parameters to change in .ini file
              resolution=64,             # structured data resolution
              verbose=False,
@@ -61,15 +60,16 @@ def generate(folder,
 
     wallclock = -perf_counter()
     meshgen = square_test_mesh if test_mesh else random_rectangle_mesh
-    meshgen(output=mshfile, coarse_size=coarse_size, verbosity=2 if verbose else 0, **kwargs)   # pass seed via kwargs
-    subprocess.run(['pyfr', 'import', mshfile, pyfrmfile], check=True)                          # converts to PyFR mesh
+    fine_size = meshgen(output=mshfile, coarse_size=coarse_size, verbosity=2 if verbose else 0, **kwargs)   # pass seed via kwargs
+    subprocess.run(['pyfr', 'import', mshfile, pyfrmfile], check=True)                                      # converts to PyFR mesh
+    dt_base *= fine_size / (coarse_size / 3.0)
 
     pyfrcommand = ['pyfr']
     if progress_bar:
         pyfrcommand.append('-p')
     pyfrcommand.extend(['run', '-b', 'cuda'])
     meshsolncfg = [pyfrmfile, inifile]
-    while dt_base >= dt_min:
+    while dt_base > 0.0:
 
         try:
             denom = int(dt_out / (dt_base * coarse_size))
@@ -88,7 +88,7 @@ def generate(folder,
         # figures out last timestep without NaNs and restarts
         except subprocess.CalledProcessError:               
             dt_base -= dt_step
-            if dt_base < dt_min:
+            if dt_base <= 0.0:
                 raise
             pyfrcommand[1+progress_bar] = 'restart'
             pyfrsfiles = sorted(((pyfrsfile, float(pyfrsfile[:-6].rsplit('.', 1)[0].rsplit('-', 1)[1]))
@@ -100,7 +100,7 @@ def generate(folder,
                     f.readline()
                     for line in f:
                         split = line.split(',')
-                        if not any(e == 'nan' for e in split[-3:]):
+                        if not any(e in {'nan', '-'} for e in split[-3:]):
                             last = float(split[1])
             for pyfrsfile, t in reversed(pyfrsfiles):
                 if t <= last + 0.1 * dt:
