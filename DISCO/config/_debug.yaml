@@ -1,0 +1,62 @@
+# wandb
+log_to_wandb: !!bool False # Use wandb integration
+save_checkpoint: !!bool False # Save checkpoints
+group: 'debug'
+run_name: 'debug'
+# training settings: short training
+pretrained: False
+max_epochs: 200
+epoch_size: 10
+batch_size: 1
+n_past: 16
+n_future: 1
+accum_grad: 1  # Real batch size is accum * batch_size, real steps/"epoch" is epoch_size / accum
+val_cutoff: 10
+optimizer: 'adam'
+learning_rate: 5e-5
+scheduler: 'cosine'  # only cosine supported
+val_rollout: 8
+gnorm: 1.0
+overfit: False  # whether to always train on the same batches
+# model settings
+model: 'disco_house'  # transformer / disco
+patch_size: 16
+embed_dim: 192  # Dimension of internal representation - 192/384/768/1024 for Ti/S/B/L
+theta_dim: 32
+num_heads: 6  # Number of heads for attention - 3/6/12/16 for Ti/S/B/L
+processor_blocks: 1  # Number of transformer blocks in the backbone - 12/12/12/24 for Ti/S/B/L
+bias_type: 'rel'
+drop_path: 0.1
+max_steps: 32
+rtol: 5e-6
+n_states: 29
+hpnn_head_hidden_dim: 384
+ndims: [2, 3]
+integration_library: "torchdiffeq"
+# data settings
+train_datasets: [
+  'euler_obc',
+  'euler_pbc',
+  'active_matter',
+  'gray_scott',
+  'mhd',
+  'rayleigh_benard',
+  'rayleigh_taylor',
+  'shear_flow',
+  'supernova',
+  'gravity_cooling',
+  'radiative_layer',
+]
+valid_datasets: [
+  'euler_obc',
+  'euler_pbc',
+  'active_matter',
+  'gray_scott',
+  'mhd',
+  'rayleigh_benard',
+  'rayleigh_taylor',
+  'shear_flow',
+  'supernova',
+  'gravity_cooling',
+  'radiative_layer',
+]

@@ -1,0 +1,16 @@
+numpy 
+scipy 
+pandas 
+matplotlib 
+notebook 
+ipykernel 
+tqdm 
+einops 
+pillow 
+torch
+h5py
+scikit-image
+timm
+ruamel.yaml
+wandb 
+torchinfo

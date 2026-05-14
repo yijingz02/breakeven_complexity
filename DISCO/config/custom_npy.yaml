@@ -1,0 +1,53 @@
+# Custom NPY Dataset Training Configuration
+# This config shows how to train on your own NPY data files
+
+# Data settings - MOST IMPORTANT FOR YOU
+# Set these to match your data:
+train_datasets: ['custom_npy']  # Dataset name to load
+valid_datasets: ['custom_npy']  # Validation dataset
+
+# Model settings (you can adjust these)
+model: 'disco_house'
+patch_size: 16
+embed_dim: 384
+num_heads: 6
+processor_blocks: 12
+bias_type: 'rel'
+drop_path: 0.1
+max_steps: 32
+rtol: 5e-6
+n_states: 12
+hpnn_head_hidden_dim: 384
+ndims: [2]  # Set to [2] for 2D data, [1] for 1D, [3] for 3D
+integration_library: "torchdiffeq"
+
+# Training hyperparameters
+group: 'custom_npy_training'
+run_name: 'custom_npy_train'
+pretrained: False
+max_epochs: 100
+epoch_size: 1000  # Samples per epoch
+batch_size: 8
+n_past: 16  # Number of input timesteps
+n_future: 1  # Number of output timesteps to predict
+accum_grad: 5  # Real batch size is accum_grad * batch_size
+val_cutoff: 10  # Number of batches for validation
+
+# Optimizer settings
+optimizer: 'adam'
+learning_rate: 5e-5
+scheduler: 'cosine'
+weight_decay: 1e-3
+warmup_epochs: 1
+val_rollout: 8  # Rollout steps for validation
+gnorm: 1.0
+
+# Logging and checkpointing
+log_to_wandb: !!bool False  # Set to True if you want to use Weights & Biases
+save_checkpoint: !!bool True
+checkpoint_save_interval: 10
+log_to_screen: !!bool True
+num_data_workers: 4
+
+# Data split
+train_val_test: [0.8, 0.1, 0.1]

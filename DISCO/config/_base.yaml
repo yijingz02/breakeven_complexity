@@ -1,0 +1,46 @@
+# run settings
+log_to_wandb: !!bool True # Use wandb integration
+log_to_screen: !!bool True # Log progress to screen.
+save_checkpoint: !!bool True # Save checkpoints
+checkpoint_save_interval: 10 # Save every # epochs - also saves "best" according to val loss
+debug_grad: !!bool True # Compute gradient/step_sizes/ect for debugging
+true_time: !!bool False # Debugging setting - sets num workers to zero and activates syncs
+num_data_workers: 6 # Generally pulling 8 cpu per process, so using 6 for DL - not sure if best ratio
+enable_amp: !!bool False # Use automatic mixed precision - blows up with low variance fields right now
+gradient_checkpointing: !!bool False # Whether to use gradient checkpointing - Slow, but lower memory
+log_interval: 200 # How often to log - Don't think this is actually implemented
+# wandb settings
+project: ''  # TODO: choose your own project name
+entity: ''  # TODO: choose your own username
+# training settings
+pretrained: False
+batch_size: 8
+inference_batch_size: null  # null -> falls back to batch_size; set to override val/test batch size
+max_epochs: 300
+epoch_size: 2000 # Artificial epoch size
+optimizer: 'adan' # adam, adan, whatever else i end up adding - adan did better on HP sweep
+scheduler: 'cosine' # Only cosine implemented
+warmup_epochs: 1 # Warmup when not using DAdapt
+learning_rate: -1 # -1 means use DAdapt  # otherwise 0.005
+weight_decay: 1e-3 
+n_past: 16 # N steps in the context (input)
+n_future: 1 # N future steps to predict (output)
+unroll_steps_train: 1 # Autoregressive unrolling steps during training (>1 enables temporal curriculum)
+use_curriculum: !!bool True # Whether to auto-increase unroll length: epochs 0-2 use 2, 3-5 use 4, 6+ use 8
+pushforward_noise_std: 0.0 # Noise std for Pushforward Trick; injects noise in predictions to teach recovery
+accum_grad: 5  # Real batch size is accum * batch_size, real steps/"epoch" is epoch_size / accum
+val_cutoff: 40  # the number of batches to use for validation after each epoch, except for the last epoch
+gnorm: null  # max gradient norm for gradient clipping
+# model settings
+model: null
+pretrained_MPP: False
+# data settings
+train_val_test: [.8, .1, .1]
+train_mode: null
+train_template: null
+train_data_params: null
+train_data_paths: []
+valid_mode: null
+valid_template: null
+valid_data_params: null
+valid_data_paths: []

@@ -41,6 +41,8 @@ def get_config() -> ConfigDict:
 # ----------------------------------- LOSS ----------------------------------- #
       # rollout steps
       "window": 1,
+      # use autoregressive rollout during training
+      "use_autoregressive": False,
       # gradient clipping
       "gradient_clip": placeholder(float),
       "data_gen_time": 0.0,
