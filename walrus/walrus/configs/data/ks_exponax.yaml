@@ -1,0 +1,17 @@
+defaults:
+- field_index_map_override: bc_only_override
+well_base_path: /data/well_format/
+wandb_data_name: ks_exponax
+module_parameters:
+  _target_: walrus.data.MixedWellDataModule
+  batch_size: 100
+  n_steps_input: 10
+  n_steps_output: 1
+  min_dt_stride: 1
+  max_dt_stride: 1
+  max_samples: 20000
+  well_dataset_info:
+    ks_exponax:
+      include_filters: []
+      exclude_filters: []
+      path: /data/well_format/ks_exponax
