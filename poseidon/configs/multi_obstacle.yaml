@@ -37,7 +37,7 @@ max_grad_norm:
 eta_step_time:
   value: 0.048
 per_data_generation_time:
-  value: 193.5667
+  value: 136.904521
 per_data_downsample_time:
   value: 0
 eval_ndata:

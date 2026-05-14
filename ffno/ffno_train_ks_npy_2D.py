@@ -20,7 +20,7 @@ import wandb
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.set_default_dtype(torch.float32)
 
-parser = argparse.ArgumentParser(description="Gray-Scott FFNO Trainer")
+parser = argparse.ArgumentParser(description="KS FFNO Trainer")
 parser.add_argument(
     "--save",
     type=str,
@@ -45,7 +45,7 @@ parser.add_argument(
     "--n_layers",
     type=int,
     # default=8,
-    default=16,
+    default=24,
     help="Model modes."
 )
 parser.add_argument(
@@ -89,18 +89,6 @@ parser.add_argument(
     type=int,
     default=1,
     help="Downsample factor for time step (for evaluation)."
-)
-parser.add_argument(
-    "--condition_frame",
-    type=int,
-    default=10,
-    help="The number of frames to condition on."
-)
-parser.add_argument(
-    "--total_frame",
-    type=int,
-    default=200,
-    help="The total number of frames."
 )
 parser.add_argument("--use_autoregressive", action="store_true", default=False, help="Use autoregressive rollout during training.")
 args = parser.parse_args()
@@ -270,7 +258,7 @@ class FNOFactorized2DBlock(nn.Module):
 
         self.out = nn.Sequential(
             WNLinear(self.width, 128, wnorm=ff_weight_norm),
-            WNLinear(128, 2, wnorm=ff_weight_norm))
+            WNLinear(128, 1, wnorm=ff_weight_norm))
 
     def forward(self, x, **kwargs):
         # x.shape == [n_batches, *dim_sizes, input_size]
@@ -311,9 +299,8 @@ width = args.width
 n_layers = args.n_layers
 
 time_budget = args.budget
-# per_step_time = 0.032 # when batch=20
-per_step_time = 0.17 # when batch=100
-per_data_generation_time = 0.47509707514047617
+per_step_time = 0.41
+per_data_generation_time = 0.06673403584957123
 per_sample_downsample_time = 0
 
 sub = args.reduced_resolution
@@ -341,8 +328,8 @@ runtime = np.zeros(2, )
 t1 = time.time()
 
 S = args.grid
-T_in = args.condition_frame
-T = args.total_frame - args.condition_frame
+T_in = 5
+T = 50 - T_in
 T_eval = 999
 step = 1
 
@@ -352,30 +339,18 @@ step = 1
 
 def load_data(file_index, n):
     u = np.load(args.data_path + f"data_{file_index}_u.npy", mmap_mode="r+")
-    v = np.load(args.data_path + f"data_{file_index}_v.npy", mmap_mode="r+")
-
     fields_u = torch.from_numpy(u).float()
-    fields_v = torch.from_numpy(v).float()
 
-    train_x_u = fields_u[:n,::sub,::sub,:T_in]
-    train_x_v = fields_v[:n,::sub,::sub,:T_in]
+    train_x = fields_u[:n,::sub,::sub,:T_in]
+    train_y = fields_u[:n,::sub,::sub,T_in:T+T_in]
+    train_x = train_x.reshape(n, S//sub, S//sub, T_in, 1)
+    train_y = train_y.reshape(n, S//sub, S//sub, T, 1)
 
-    # print(type(train_x_u))
-
-    train_x = torch.stack([train_x_u, train_x_v], dim=-1)
-
-    train_y_u = fields_u[:n,::sub,::sub,T_in:T+T_in]
-    train_y_v = fields_v[:n,::sub,::sub,T_in:T+T_in]
-    train_y = torch.stack([train_y_u, train_y_v], dim=-1)
-
-    train_x = train_x.reshape(n, S//sub, S//sub, T_in, 2)
-    train_y = train_y.reshape(n, S//sub, S//sub, T, 2)
-
-    # print("data x size:", train_x.shape)
-    # print("data x device", train_x.device)
+    print("data size:", train_x.shape)
+    print("data device", train_x.device)
 
     if file_index == "val":
-        train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_x, train_y), batch_size=100, shuffle=False)
+        train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_x, train_y), batch_size=10, shuffle=False)
     else:
         train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_x, train_y), batch_size=batch_size, shuffle=True)
 
@@ -383,7 +358,7 @@ def load_data(file_index, n):
 
 t1 = time.time()
 
-train_loader = load_data(0, min(2000, ntrain))
+train_loader = load_data(0, min(20000, ntrain))
 cur_data_file_loaded = 0
 print("load train data finished")
 
@@ -394,7 +369,7 @@ t2 = time.time()
 
 print('preprocessing finished, time used:', t2-t1)
 
-output_path = f"ffno_GS_NvsB_budget{int(time_budget)}_n{ntrain}_w{width}_m{modes}_batch{batch_size}"
+output_path = f"ffno_KS_NvsB_budget{int(time_budget)}_n{ntrain}_w{width}_m{modes}_batch{batch_size}"
 
 ################################################################
 # training and evaluation
@@ -422,7 +397,7 @@ else:
     print("No checkpoint found. New training.")
 
 wandb.init(
-    project=f"ffno_gs",
+    project=f"ffno_ks_2D",
     group=f"B{int(time_budget)}",
     name=f"n{ntrain}_B{int(time_budget)}"
 )
@@ -430,7 +405,7 @@ wandb.init(
 model = FNOFactorized2DBlock(
     modes=modes,
     width=width,
-    input_dim=2*T_in,
+    input_dim=T_in,
     # out_dim=1,
     dropout=0.0,
     in_dropout=0.0,
@@ -474,43 +449,37 @@ if use_checkpoint:
 
 # warm-up
 for xx, yy in train_loader:
-    # xx = xx.to(device)
-    # yy = yy.to(device)
+    xx = xx.to(device)
+    yy = yy.to(device)
 
-    for t in range(0, T):
-        loss = 0.0
+    B = xx.shape[0]
 
+    for t in range(T):
         optimizer.zero_grad(set_to_none=True)
 
         if t == 0:
-            inp = xx[..., :T_in, :]
+            win = xx[..., :T_in, :]
         elif t < T_in:
-            inp = torch.cat(
-                [xx[..., -T_in + t:, :],
-                 yy[..., :t, :]],
-                dim=-2
+            win = torch.cat(
+                [xx[..., -T_in + t:, :],  
+                 yy[..., :t, :]],       
+                dim=-2       
             )
         else:
-            inp = yy[..., t - T_in:t, :] 
+            win = yy[..., t - T_in:t, :]
 
-        inp = inp.reshape(batch_size, S, S, T_in * 2)
+        inp = win.squeeze(-1)
 
         if noise_std > 0:
             inp = inp + noise_std * torch.randn_like(inp)
-                
+
         y = yy[..., t, :]
 
-        inp = inp.to(device)
-        y = y.to(device)
-
-        out = model(inp)['forecast'] 
+        out = model(inp)['forecast']
         loss = loss_fn(out, y)
 
         loss.backward()
         optimizer.step()
-
-        inp = inp.to("cpu")
-        y = y.to("cpu")
 
         break
 
@@ -521,7 +490,7 @@ print("warm up finished")
 gc.collect()
 torch.cuda.empty_cache()
 
-while cur_total_time < train_budget:
+while cur_total_time <= train_budget:
     # print("ep:", ep)
     ep += 1
 
@@ -530,60 +499,52 @@ while cur_total_time < train_budget:
 
     model.train()
 
-    for i in range(10):
-        if cur_data_file_loaded != i and trained_data < ntrain:
-            train_loader = load_data(i, min(2000, ntrain - trained_data))
-            cur_data_file_loaded = i
-
+    for i in range(1):
         for xx, yy in train_loader:
             trained_data += batch_size
+
+            xx = xx.to(device)
+            yy = yy.to(device)
 
             # Initialize autoregressive state if needed
             if args.use_autoregressive:
                 ar_state = xx.clone()  # Start with initial condition
 
-            for t in range(0, T):
-                loss = 0.0
+            B = xx.shape[0]
+
+            for t in range(T):
+                optimizer.zero_grad(set_to_none=True)
 
                 if not args.use_autoregressive:
                     # Teacher forcing: use ground truth
                     if t == 0:
-                        inp = xx[..., :T_in, :]
+                        win = xx[..., :T_in, :]
                     elif t < T_in:
-                        tmp_x = xx[..., -T_in + t:, :].to(device)
-                        tmp_y = yy[..., :t, :].to(device)
-
-                        inp = torch.cat(
-                            [tmp_x,
-                             tmp_y],
-                            dim=-2
+                        win = torch.cat(
+                            [xx[..., -T_in + t:, :],  
+                            yy[..., :t, :]],       
+                            dim=-2       
                         )
-
-                        tmp_x = tmp_x.to("cpu")
-                        tmp_y = tmp_y.to("cpu")
                     else:
-                        inp = yy[..., t - T_in:t, :] 
+                        win = yy[..., t - T_in:t, :]
                 else:
                     # Autoregressive: use model predictions
                     if t == 0:
-                        inp = xx[..., :T_in, :]  # Use initial condition
+                        win = xx[..., :T_in, :]  # Use initial condition
                     else:
                         # Use last T_in timesteps from autoregressive state
-                        inp = ar_state[..., -T_in:, :]
+                        win = ar_state[..., -T_in:, :]
 
-                inp = inp.reshape(batch_size, S, S, T_in * 2)
+                inp = win.squeeze(-1)
 
                 if noise_std > 0:
                     inp = inp + noise_std * torch.randn_like(inp)
 
-                y = yy[..., t, :] 
-
-                inp = inp.to(device)
-                y = y.to(device)
+                y = yy[..., t, :]
 
                 t_step_s = time.time()
 
-                out = model(inp)['forecast'] 
+                out = model(inp)['forecast']
                 loss = loss_fn(out, y)
 
                 optimizer.zero_grad(set_to_none=True)
@@ -593,37 +554,26 @@ while cur_total_time < train_budget:
 
                 # Update autoregressive state with prediction
                 if args.use_autoregressive:
-                    out_expanded = out.reshape(batch_size, S, S, 1)
-                    ar_state = torch.cat([ar_state[..., 1:, :], out_expanded], dim=-2)
+                    ar_state = torch.cat([ar_state[..., 1:, :], out.unsqueeze(-1)], dim=-2)
 
                 t_step_e = time.time()
                 step_time = t_step_e - t_step_s
                 cur_total_time += step_time
                 train_step_loss += float(loss.item())
 
-                inp = inp.to("cpu")
-                y = y.to("cpu")
-
-                gc.collect()
-                torch.cuda.empty_cache()
-
-                # print("Cur step:", scheduler.last_epoch)
-                # print("Cur step time:", step_time)
-                # print("Total time:", cur_total_time)
-
-            if cur_total_time >= train_budget:
+            if cur_total_time > train_budget:
                 break
 
             if trained_data >= ntrain:
                 break
 
-        if cur_total_time >= train_budget:
+        if cur_total_time > train_budget:
             break
 
         if trained_data >= ntrain:
             break
-  
-    if ep % 10 == 0 or cur_total_time >= train_budget:
+
+    if ep % 10 == 0 or cur_total_time > train_budget:
         wandb.log({
             "epoch": ep,
             "step": scheduler.last_epoch,
@@ -636,8 +586,7 @@ while cur_total_time < train_budget:
         ckpt = {
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
-            "epoch": ep,
-            # "step": scheduler.last_epoch,           
+            "epoch": ep,        
             "scheduler_state": scheduler.state_dict(),
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -652,7 +601,7 @@ shutil.copy(args.save + "/model/" + output_path, home_path + args.save + "/model
 import math
 def traj_l2(preds, targets):
     """
-    preds, targets: (B, S, S, T, 1)  or (B, S, S, T)
+    preds, targets: (B, S, S, T, 1)  or (B, S, S, T) 都行
     return: per-sample L2 over (S,S,T,channels) => shape (B,)
     """
     if preds.dim() == 4:   # (B,S,S,T)
@@ -672,17 +621,18 @@ val_step_loss = 0
 full_loss_sum = 0
 worst_loss = -math.inf
 worst_idx  = -1
+
 global_base = 0
 
 with torch.no_grad():
     for xx, yy in val_loader:
         B = xx.shape[0]
 
-        window = xx[..., :T_in, :]     # CPU: (B,S,S,T_in,2)
+        window = xx[..., :T_in, :]     # CPU: (B,S,S,T_in,1)
 
         preds_list = []
         for t in range(T):
-            inp = window.flatten(start_dim=-2).contiguous().to(device, non_blocking=True)
+            inp = window.squeeze(-1).contiguous().to(device, non_blocking=True) 
             out = model(inp)['forecast']                  
 
             y   = yy[..., t, :].contiguous().to(device, non_blocking=True)
@@ -690,8 +640,8 @@ with torch.no_grad():
 
             preds_list.append(out.detach().cpu().unsqueeze(-2))
 
-            out_cpu = out.detach().cpu().unsqueeze(-2)                           # (B,S,S,1,2)
-            window = torch.cat([window[..., 1:, :], out_cpu], dim=-2)            # (B,S,S,T_in,2)
+            out_cpu = out.detach().cpu().unsqueeze(-2)                           # (B,S,S,1,1)
+            window = torch.cat([window[..., 1:, :], out_cpu], dim=-2)            # (B,S,S,T_in,1)
 
             del inp, out, y
 
@@ -699,6 +649,7 @@ with torch.no_grad():
         per_sample = traj_l2(preds, yy)
 
         full_loss_sum += float(per_sample.sum().item())
+
         batch_worst_loss, batch_worst_j = torch.max(per_sample, dim=0)
         batch_worst_loss = float(batch_worst_loss.item())
         batch_worst_j = int(batch_worst_j.item())

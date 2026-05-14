@@ -594,6 +594,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Set this if you have to replace the embeddings and recovery layers because you are not just using the density, velocity and pressure channels. Only relevant for finetuning.",
     )
+    parser.add_argument(
+        "--use_autoregressive",
+        action="store_true",
+        help="Use autoregressive rollout during training",
+    )
     params = read_cli(parser).parse_args()
     run, config, ckpt_dir, RANK, CPU_CORES = setup(params)
 
@@ -856,7 +861,8 @@ if __name__ == "__main__":
             eval_dataset=None,
             compute_metrics=compute_metrics,
             time_budget=train_time_budget,
-            callbacks=[SaveEveryNEpochs(50)]
+            callbacks=[SaveEveryNEpochs(50)],
+            use_autoregressive=params.use_autoregressive
         )
 
         return trainer, train_config
