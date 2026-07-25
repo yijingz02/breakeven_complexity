@@ -1,5 +1,5 @@
 """ Main training script, inspired from: 
-https://github.com/anonymous/multiple_physics_pretraining/blob/main/train_basic.py """
+https://github.com/PolymathicAI/multiple_physics_pretraining/blob/main/train_basic.py """
 import argparse
 import math
 import os
@@ -152,12 +152,131 @@ def model_rollout(
     return out, metadata
 
 
+_TIME_AVG_QUANTITIES = [
+    'vorticity', 'velocity_x', 'velocity_y', 'pressure',
+    'velocity', 'vxvyp', 'all_fields',
+]
+
+
+def _time_avg_nrmse_per_sample(pred, ref, eps=1e-12):
+    batch_size = pred.shape[0]
+    numerator = (pred - ref).reshape(batch_size, -1).pow(2).sum(dim=1)
+    denominator = ref.reshape(batch_size, -1).pow(2).sum(dim=1).clamp_min(eps)
+    return torch.sqrt(numerator / denominator)
+
+
+def _flip_multi_obstacle_fields(fields, names):
+    """Flip B,C,H,W fields using the same parity as Poseidon's evaluator."""
+    flipped = torch.flip(fields, dims=[-1])
+    for channel_idx, name in enumerate(names):
+        if name in {'vorticity', 'velocity_x'}:
+            flipped[:, channel_idx] *= -1.0
+    return flipped
+
+
+def multi_obstacle_time_avg_scores(predictions, references, mask=None, last_n=160):
+    """Return per-trajectory flip/no-flip time-average NRMSE scores."""
+    # DISCO evaluation tensors are B,T,C,H,W.
+    predictions = predictions.float()
+    references = references.float()
+    k = min(int(last_n), predictions.shape[1], references.shape[1])
+    if k <= 0:
+        return {}
+
+    if mask is not None:
+        fluid = mask.to(device=predictions.device, dtype=predictions.dtype)
+        if fluid.ndim == 3:
+            fluid = fluid[:, None, None, ...]
+        elif fluid.ndim == 4:
+            fluid = fluid[:, None, ...]
+        predictions = predictions * fluid
+        references = references * fluid
+
+    pred_avg = predictions[:, -k:].mean(dim=1)
+    ref_avg = references[:, -k:].mean(dim=1)
+
+    if pred_avg.shape[1] >= 3 and ref_avg.shape[1] >= 3:
+        channel_names = ['velocity_x', 'velocity_y', 'pressure']
+        groups = {
+            'velocity_x': [0],
+            'velocity_y': [1],
+            'pressure': [2],
+            'velocity': [0, 1],
+            'vxvyp': [0, 1, 2],
+            'all_fields': [0, 1, 2],
+        }
+    elif pred_avg.shape[1] == 1 and ref_avg.shape[1] == 1:
+        channel_names = ['vorticity']
+        groups = {'vorticity': [0], 'all_fields': [0]}
+    else:
+        return {}
+
+    scores = {}
+    for group_name, indices in groups.items():
+        names = [channel_names[idx] for idx in indices]
+        pred_fields = pred_avg[:, indices]
+        ref_fields = ref_avg[:, indices]
+        scores[f'tavg_flip_{group_name}'] = _time_avg_nrmse_per_sample(
+            pred_fields + _flip_multi_obstacle_fields(pred_fields, names),
+            ref_fields + _flip_multi_obstacle_fields(ref_fields, names),
+        )
+        scores[f'tavg_noflip_{group_name}'] = _time_avg_nrmse_per_sample(
+            pred_fields, ref_fields
+        )
+    return scores
+
+
+def channelwise_physical_nrmse_breakflow(
+    predictions, references, mask=None, eps=1e-12
+):
+    """Return B,3 physical-unit nRMSE for vx, vy, and pressure.
+
+    DISCO BreakFlow tensors are B,T,C,H,W and are already reconstructed in
+    physical units when ``predict_normed=True``. Pressure is gauge-centered
+    spatially for each sample and frame.
+    """
+    predictions = predictions.float()
+    references = references.float()
+    if predictions.shape[2] < 3 or references.shape[2] < 3:
+        raise ValueError("BreakFlow physical nRMSE requires vx, vy, pressure channels")
+
+    if mask is None:
+        fluid = torch.ones(
+            predictions.shape[0], 1, 1, *predictions.shape[-2:],
+            device=predictions.device,
+            dtype=predictions.dtype,
+        )
+    else:
+        fluid = mask.to(device=predictions.device, dtype=predictions.dtype)
+        if fluid.ndim == 3:
+            fluid = fluid[:, None, None]
+        elif fluid.ndim == 4:
+            fluid = fluid[:, None]
+        fluid = (fluid > 0.5).to(predictions.dtype)
+
+    pred = predictions[:, :, :3].clone()
+    ref = references[:, :, :3].clone()
+    pressure_weight = fluid[:, :, 0]
+    pressure_count = pressure_weight.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0)
+    pred[:, :, 2] -= (
+        (pred[:, :, 2] * pressure_weight).sum(dim=(-2, -1), keepdim=True)
+        / pressure_count
+    )
+    ref[:, :, 2] -= (
+        (ref[:, :, 2] * pressure_weight).sum(dim=(-2, -1), keepdim=True)
+        / pressure_count
+    )
+
+    numerator = ((pred - ref).square() * fluid).sum(dim=(1, 3, 4))
+    denominator = (ref.square() * fluid).sum(dim=(1, 3, 4)).clamp_min(eps)
+    return torch.sqrt(numerator / denominator)
+
+
 class Trainer:
 
-    def __init__(self, params, global_rank, local_rank, device, use_autoregressive=False):
+    def __init__(self, params, global_rank, local_rank, device):
         self.device = device
         self.params = params
-        self.use_autoregressive = use_autoregressive
         self.base_dtype = torch.float
         self.global_rank = global_rank
         self.local_rank = local_rank
@@ -560,23 +679,12 @@ class Trainer:
                 
                 # forward
                 tt.track("forward", "training", "forw_batch")
-                if self.use_autoregressive:
-                    # Use autoregressive rollout for training
-                    output, metadata = model_rollout(
-                        self.model,
-                        inp, predict_normed=False,
-                        n_future_steps=self.params.n_future,
-                        state_labels=state_labels[0],
-                        dset_name=dset_name,
-                    )
-                else:
-                    # Standard teacher forcing (single forward pass)
-                    output, metadata = self.model(
-                        inp, predict_normed=False, 
-                        # n_future_steps=self.params.n_future, 
-                        state_labels=state_labels[0],
-                        dset_name=dset_name,
-                    )
+                output, metadata = self.model(
+                    inp, predict_normed=False, 
+                    # n_future_steps=self.params.n_future, 
+                    state_labels=state_labels[0],
+                    dset_name=dset_name,
+                )
                 tar = (tar - metadata['mean']) / metadata['std']  # normalize tar
 
                 # Apply mask if present (mask shape [B,1,1,H,W])
@@ -896,6 +1004,33 @@ class Trainer:
                 sample_sum_full = {dset_name: torch.zeros(1, device=self.device, dtype=self.base_dtype) for dset_name in distinct_dsets}
                 sample_sum_step = {dset_name: torch.zeros(1, device=self.device, dtype=self.base_dtype) for dset_name in distinct_dsets}
                 sample_counts = {dset_name: torch.zeros(1, device=self.device, dtype=self.base_dtype) for dset_name in distinct_dsets}
+                time_avg_sums = {
+                    dset_name: {
+                        f'tavg_{mode}_{quantity}': torch.zeros(
+                            1, device=self.device, dtype=self.base_dtype
+                        )
+                        for mode in ('flip', 'noflip')
+                        for quantity in _TIME_AVG_QUANTITIES
+                    }
+                    for dset_name in distinct_dsets
+                    if dset_name == 'breakflow'
+                }
+                time_avg_counts = {
+                    dset_name: {
+                        key: torch.zeros(1, device=self.device, dtype=self.base_dtype)
+                        for key in time_avg_sums[dset_name]
+                    }
+                    for dset_name in time_avg_sums
+                }
+                physical_nrmse_sums = {
+                    dset_name: torch.zeros(3, device=self.device, dtype=torch.float64)
+                    for dset_name in distinct_dsets
+                    if dset_name == 'breakflow'
+                }
+                physical_nrmse_counts = {
+                    dset_name: torch.zeros(1, device=self.device, dtype=torch.float64)
+                    for dset_name in physical_nrmse_sums
+                }
                 for dset_name in distinct_dsets:
                     logs[f'{dset_name}/test_nrmse_rollout'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
                     logs[f'{dset_name}/test_nrmse_step'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
@@ -971,6 +1106,37 @@ class Trainer:
                         metric_tar = tar.float()
                         metric_output = output.float()
 
+                        physical_batch_scores = None
+                        if dset_name in physical_nrmse_sums:
+                            physical_mask = batch.get('mask')
+                            if physical_mask is not None:
+                                physical_mask = physical_mask[:metric_output.shape[0]]
+                            physical_batch_scores = channelwise_physical_nrmse_breakflow(
+                                metric_output,
+                                metric_tar,
+                                mask=physical_mask,
+                            )
+                            physical_nrmse_sums[dset_name] += (
+                                physical_batch_scores.double().sum(dim=0)
+                            )
+                            physical_nrmse_counts[dset_name] += float(
+                                physical_batch_scores.shape[0]
+                            )
+
+                        if dset_name in time_avg_sums:
+                            time_avg_mask = batch.get('mask')
+                            if time_avg_mask is not None:
+                                time_avg_mask = time_avg_mask[:metric_output.shape[0]]
+                            time_avg_batch_scores = multi_obstacle_time_avg_scores(
+                                metric_output,
+                                metric_tar,
+                                mask=time_avg_mask,
+                                last_n=160,
+                            )
+                            for key, values in time_avg_batch_scores.items():
+                                time_avg_sums[dset_name][key] += values.sum()
+                                time_avg_counts[dset_name][key] += float(values.shape[0])
+
                         spatial_dims = tuple(range(metric_output.ndim))[3:]
                         test_nrmse = nrmse(metric_tar, metric_output, dims=spatial_dims)
                         
@@ -996,7 +1162,12 @@ class Trainer:
                         sample_sum_step[dset_name] += step_rel_per_sample.sum()
                         sample_counts[dset_name] += float(metric_tar.shape[0])
                         
-                        sample_scores = test_nrmse.mean(dim=tuple(range(1, test_nrmse.ndim)))
+                        if physical_batch_scores is not None:
+                            sample_scores = physical_batch_scores.mean(dim=1)
+                        else:
+                            sample_scores = test_nrmse.mean(
+                                dim=tuple(range(1, test_nrmse.ndim))
+                            )
                         batch_worst_nrmse, batch_worst_pos = torch.max(sample_scores, dim=0)
                         batch_indices = batch['index'].to(self.device).float()
                         batch_worst_idx = batch_indices[batch_worst_pos]
@@ -1022,6 +1193,13 @@ class Trainer:
                     dist.all_reduce(sample_sum_full[dset_name])
                     dist.all_reduce(sample_sum_step[dset_name])
                     dist.all_reduce(sample_counts[dset_name])
+                for dset_name in time_avg_sums:
+                    for key in time_avg_sums[dset_name]:
+                        dist.all_reduce(time_avg_sums[dset_name][key])
+                        dist.all_reduce(time_avg_counts[dset_name][key])
+                for dset_name in physical_nrmse_sums:
+                    dist.all_reduce(physical_nrmse_sums[dset_name])
+                    dist.all_reduce(physical_nrmse_counts[dset_name])
                 for key in sorted(logs.keys()):
                     dist.all_reduce(logs[key])
                 dist.all_reduce(total_inference_wallclock)
@@ -1037,6 +1215,29 @@ class Trainer:
                     logs[f'{dset_name}/test_nrmse_rollout'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
                     logs[f'{dset_name}/test_nrmse_step'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
                     logs[f'{dset_name}/test_relative_l2_rollout'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
+
+            for dset_name in time_avg_sums:
+                for key, score_sum in time_avg_sums[dset_name].items():
+                    score_count = time_avg_counts[dset_name][key]
+                    if score_count > 0:
+                        mode, quantity = key[len('tavg_'):].split('_', 1)
+                        logs[f'{dset_name}/test/{quantity}/tavg_{mode}_nrmse'] = (
+                            score_sum / score_count
+                        )
+
+            physical_channel_names = [
+                'velocity_x', 'velocity_y', 'pressure_gauge_centered'
+            ]
+            for dset_name, score_sum in physical_nrmse_sums.items():
+                score_count = physical_nrmse_counts[dset_name].clamp_min(1.0)
+                channel_scores = score_sum / score_count
+                macro_score = channel_scores.mean()
+                for channel_idx, channel_name in enumerate(physical_channel_names):
+                    logs[
+                        f'{dset_name}/test/channelwise_physical_nrmse/{channel_name}'
+                    ] = channel_scores[channel_idx]
+                logs[f'{dset_name}/test/channelwise_physical_nrmse_macro'] = macro_score
+                logs[f'{dset_name}/test_nrmse_rollout'] = macro_score
 
             # Aggregate per-step metrics using batch counting (as before)
             for k, v in logs.items():
@@ -1207,6 +1408,14 @@ class Trainer:
             if self.global_rank == 0 and 'valid_nrmse' in valid_logs and valid_logs['valid_nrmse'] <= best_valid_loss:
                 self.save_checkpoint(self.params.best_checkpoint_path)
 
+        # Save once more after final evaluation so every normal exit has a final,
+        # resumable checkpoint in the persistent checkpoint directory.
+        if self.global_rank == 0 and self.params.save_checkpoint:
+            self.save_checkpoint(self.params.checkpoint_path)
+            self.single_print(f"Saved final checkpoint to {self.params.checkpoint_path}")
+            if self.params.log_to_wandb:
+                wandb.run.summary["checkpoint_path"] = self.params.checkpoint_path
+
 
 if __name__ == '__main__':
 
@@ -1221,12 +1430,12 @@ if __name__ == '__main__':
     parser.add_argument("--time_budget", type=float, default=None, help='Time budget in seconds (placeholder for future use)')
     parser.add_argument("--ntrain", type=int, default=None, help='Number of training samples to load/use per epoch')
     parser.add_argument("--per_data_gen_cost", type=float, default=0.0, help='Per-sample data generation cost in seconds')
-    parser.add_argument("--checkpoint_dir", type=str, default=None, help='Directory for checkpoints; resume if ckpt.tar exists')
+    parser.add_argument("--checkpoint_dir", type=str, default=None,
+                        help='Directory for checkpoints; defaults under MODEL_STORAGE_ROOT/DISCO and resumes if ckpt.tar exists')
     parser.add_argument("--timing_warmup_steps", type=int, default=3, help='Number of optimizer warmup steps excluded from budget')
     parser.add_argument("--timing_avg_steps", type=int, default=3, help='Number of post-warmup optimizer steps (3-5) for avg step time')
     parser.add_argument("--test_max_batches", type=int, default=None, help='Optional cap on batches for final test evaluation (None = all)')
     parser.add_argument("--test_max_samples_grayscott", type=int, default=None, help='Optional cap on Gray-Scott test samples (None = all)')
-    parser.add_argument("--use_autoregressive", action='store_true', help='Use autoregressive rollout during training')
     args = parser.parse_args()
 
     # Config 
@@ -1273,7 +1482,16 @@ if __name__ == '__main__':
         params['exp_dir'] = str((Path(__file__).resolve().parent / 'experiments').resolve())
     exp_dir = Path(params.exp_dir) / params.run_name
     params['experiment_dir'] = str(exp_dir)
-    checkpoint_dir = Path(args.checkpoint_dir).resolve() if args.checkpoint_dir is not None else (exp_dir / 'training_checkpoints')
+    default_checkpoint_name = ''.join(
+        ch if ch.isalnum() or ch in '._-' else '_' for ch in str(params.run_name)
+    )
+    if args.time_budget is not None and params['ntrain'] is not None:
+        default_checkpoint_name += f"_N{int(params['ntrain'])}_B{int(args.time_budget)}"
+    checkpoint_dir = (
+        Path(args.checkpoint_dir).resolve()
+        if args.checkpoint_dir is not None
+        else Path(os.environ.get("MODEL_STORAGE_ROOT", "checkpoints")) / "DISCO" / default_checkpoint_name
+    )
     params['checkpoint_dir'] = str(checkpoint_dir)
     params['checkpoint_path'] = str(checkpoint_dir / 'ckpt.tar')
     params['best_checkpoint_path'] = str(checkpoint_dir / 'best_ckpt.tar')
@@ -1313,7 +1531,7 @@ if __name__ == '__main__':
             yaml.dump(hparams, hpfile)
 
     # Start training
-    trainer = Trainer(params, global_rank, local_rank, device, use_autoregressive=args.use_autoregressive)
+    trainer = Trainer(params, global_rank, local_rank, device)
     trainer.train()
 
     if params.log_to_wandb:
