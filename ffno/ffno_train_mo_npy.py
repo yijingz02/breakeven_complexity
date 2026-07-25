@@ -1,3 +1,22 @@
+#!/usr/bin/env python3
+# ffno_multi_obstacle_incompressible_multiframe_mask.py
+#
+# Train FFNO on multi-obstacle flow (velocity_x, velocity_y, pressure) with static obstacle mask,
+# conditioning on a history window (multi-frame).
+#
+# Expected shapes (time-first):
+#   velocity_x: (N, T_total, H, W)
+#   velocity_y: (N, T_total, H, W)
+#   pressure:   (N, T_total, H, W)
+#   mask:       (N, H, W)   boolean-ish
+#
+# Conditioning:
+#   At each step, input features per pixel = concat([vx,vy,p] over T_in frames, mask) -> (B,H,W,3*T_in+1)
+#   Output per step = (vx,vy,p) at next frame -> (B,H,W,3)
+#
+# By default this keeps your original "masked-to-fluid loss" behavior (like your vorticity script),
+# but you can turn it OFF (paper-style) via --no_mask_loss.
+
 import os
 import shutil
 import time
@@ -19,15 +38,15 @@ torch.set_default_dtype(torch.float32)
 # -------------------------
 # Args
 # -------------------------
-parser = argparse.ArgumentParser(description="MO FFNO Trainer")
+parser = argparse.ArgumentParser(description="FFNO Multi-Obstacle (vx,vy,p multiframe + mask conditioning)")
 parser.add_argument("--save", type=str, default="output_isotime", help="Directory to save model/logs.")
 parser.add_argument("--width", type=int, default=64, help="Model width.")
 parser.add_argument("--modes", type=int, default=16, help="Fourier modes.")
 parser.add_argument("--n_layers", type=int, default=24, help="Number of FFNO layers.")
 parser.add_argument("--budget", type=float, default=100, help="Time budget in seconds.")
 parser.add_argument("--ndata", type=int, default=1000, help="Training data size.")
-parser.add_argument("--data_path", type=str, default=".", help="Path to .npy data.")
-parser.add_argument("--batch_size", type=int, default=16, help="Batch size.")
+parser.add_argument("--data_path", type=str, default="../generated_large_g256_fp32/", help="Path to .npy data.")
+parser.add_argument("--batch_size", type=int, default=100, help="Batch size.")
 parser.add_argument("--reduced_resolution", type=int, default=1, help="Downsample factor for H/W.")
 parser.add_argument("--noise_std", type=float, default=0.01, help="Input Gaussian noise std.")
 
@@ -53,18 +72,6 @@ parser.add_argument("--std_vy",  type=float, default=0.5268091559410095)
 parser.add_argument("--std_p",   type=float, default=1.060120940208435)
 
 args = parser.parse_args()
-
-# -------------------------
-# Output dirs (same pattern you used)
-# -------------------------
-os.makedirs(args.save, exist_ok=True)
-os.makedirs(os.path.join(args.save, "model"), exist_ok=True)
-os.makedirs(os.path.join(args.save, "log"), exist_ok=True)
-
-home_path = "."
-os.makedirs(os.path.join(home_path, args.save), exist_ok=True)
-os.makedirs(os.path.join(home_path, args.save, "model"), exist_ok=True)
-os.makedirs(os.path.join(home_path, args.save, "log"), exist_ok=True)
 
 # -------------------------
 # FFNO modules (your original, with small change: out_dim param)
@@ -275,36 +282,25 @@ def to_fluid_mask(mask):
     else:
         return mask         # already 1=fluid
 
-# Use your utilities.LpLoss. With size_average=False it returns a SUM over batch.
-lp_loss = LpLoss(size_average=False)
+def l2_loss(out, y):
+    # out,y: (B,H,W,C)
+    diff = out - y
+    B = diff.shape[0]
+    return torch.norm(diff.reshape(B, -1), p=2, dim=1).mean()
 
-def lp_loss_sum(out, y):
-    # out,y: (B,H,W,C) -> scalar SUM over batch
-    B = out.shape[0]
-    return lp_loss(out.reshape(B, -1), y.reshape(B, -1))
-
-def masked_rmse_sum(out, y, fluid, eps=1e-12):
+def masked_l2_loss(out, y, fluid):
     # out,y: (B,H,W,C), fluid: (B,H,W,1)
-    # returns SUM over batch of per-sample RMSE over fluid pixels (avg over channels)
-    diff2 = ((out - y) * fluid).pow(2)  # (B,H,W,C)
-    B = diff2.shape[0]
-    num = diff2.sum(dim=(1, 2, 3))  # (B,)
-    den = (fluid.sum(dim=(1, 2, 3)).clamp_min(1.0) * out.shape[-1])  # (B,)
-    rmse = torch.sqrt(num / den + eps)  # (B,)
-    return rmse.sum()
-
-def step_loss_sum(out, y, fluid):
-    # always returns a BATCH-SUM scalar
-    if args.no_mask_loss:
-        return lp_loss_sum(out, y)
-    else:
-        return masked_rmse_sum(out, y, fluid)
+    # compute RMSE over fluid pixels, averaged over channels
+    diff = (out - y) * fluid  # broadcast over C
+    denom = fluid.sum().clamp_min(1.0) * out.shape[-1]
+    mse = (diff * diff).sum() / denom
+    return torch.sqrt(mse + 1e-12)
 
 def traj_l2(preds, targets, fluid=None):
-    # preds/targets: (B,H,W,T,C) -> per-sample L2 over space-time-channels
+    # preds/targets: (B,H,W,T,C)
     diff = preds - targets
     if fluid is not None:
-        diff = diff * fluid.unsqueeze(-2)  # (B,H,W,1)->(B,H,W,1,1)
+        diff = diff * fluid.unsqueeze(-2)  # (B,H,W,1)->(B,H,W,1,1) over T,C
     B = diff.shape[0]
     return torch.norm(diff.reshape(B, -1), p=2, dim=1)
 
@@ -369,10 +365,11 @@ def load_data(file_index, n):
     y_t = torch.stack([vx_y, vy_y, pp_y], dim=-1)       # (n,T,H',W',3)
 
     # normalize physical channels only
+    # broadcast MEAN/STD: (3,) -> (1,1,1,1,3)
     x_t = (x_t - MEAN.view(1, 1, 1, 1, 3)) / STD.view(1, 1, 1, 1, 3)
     y_t = (y_t - MEAN.view(1, 1, 1, 1, 3)) / STD.view(1, 1, 1, 1, 3)
 
-    # permute to time-last: (n,H',W',T_in,3), (n,H',W',T,3)
+    # permute to time-last for easier windowing: (n,H',W',T_in,3), (n,H',W',T,3)
     x = x_t.permute(0, 2, 3, 1, 4).contiguous()
     y = y_t.permute(0, 2, 3, 1, 4).contiguous()
 
@@ -400,42 +397,21 @@ val_loader = load_data("val", ntest)
 print("load val data finished")
 
 output_path = f"ffno_multiobs_incomp_B{int(time_budget)}_n{ntrain}_w{width}_m{modes}_batch{batch_size}_Tin{T_in}_T{T_total_used}"
-
-# -------------------------
-# checkpoint logic
-# -------------------------
-use_checkpoint = False
-ckpt_pth = None
-
-if os.path.isfile(os.path.join(home_path, args.save, "model", output_path)):
-    print("Trained.")
-    raise SystemExit(0)
-
-local_ckpt = os.path.join(args.save, "model", output_path + "_checkpoint")
-home_ckpt  = os.path.join(home_path, args.save, "model", output_path + "_checkpoint")
-
-if os.path.isfile(local_ckpt):
-    print("Checkpoint found at machine. Uses checkpoint.")
-    use_checkpoint = True
-    ckpt_pth = local_ckpt
-elif os.path.isfile(home_ckpt):
-    print("Checkpoint found at home dir. Uses checkpoint.")
-    use_checkpoint = True
-    ckpt_pth = home_ckpt
-else:
-    print("No checkpoint found. New training.")
+local_ckpt = os.path.join(args.save, "model", f"{output_path}.pt")
 
 # -------------------------
 # wandb
 # -------------------------
 wandb.init(
-    project="ffno_multi_obstacle_velocity_pressure_new2",
+    project="ffno_multi_obstacle_velocity_pressure",
     group=f"B{int(time_budget)}",
     name=f"incomp_n{ntrain}_B{int(time_budget)}_Tin{T_in}_T{T_total_used}",
 )
 
 # -------------------------
 # model/optim
+# input_dim = 3*T_in + 1 (mask)
+# out_dim   = 3 (vx,vy,p)
 # -------------------------
 in_dim = 3 * T_in + 1
 out_dim = 3
@@ -482,34 +458,36 @@ if use_checkpoint:
     cur_total_time = float(ckpt["train_time"])
 
 for xx, yy, mask in train_loader:
-    xx = xx.to(device)
-    yy = yy.to(device)
-    mask = mask.to(device)
+    xx = xx.to(device)      # (B,H,W,T_in,3)
+    yy = yy.to(device)      # (B,H,W,T,3)
+    mask = mask.to(device)  # (B,H,W,1)
     fluid = to_fluid_mask(mask)
 
     for t in range(T):
         optimizer.zero_grad(set_to_none=True)
 
         if t == 0:
-            win = xx[..., :T_in, :]
+            win = xx[..., :T_in, :]  # (B,H,W,T_in,3)
         elif t < T_in:
             win = torch.cat([xx[..., -T_in + t:, :], yy[..., :t, :]], dim=-2)
         else:
             win = yy[..., t - T_in:t, :]
 
+        # flatten time*channels: (B,H,W,T_in,3) -> (B,H,W,3*T_in)
         inp = win.reshape(win.shape[0], win.shape[1], win.shape[2], 3 * T_in)
-        inp = torch.cat([inp, mask], dim=-1)
+        inp = torch.cat([inp, mask], dim=-1)  # (B,H,W,3*T_in+1)
 
         if noise_std > 0:
             inp = inp + noise_std * torch.randn_like(inp)
 
-        y = yy[..., t, :]
-        out = model(inp)['forecast']
+        y = yy[..., t, :]  # (B,H,W,3)
+
+        out = model(inp)['forecast']  # (B,H,W,3)
 
         if args.zero_pred_in_obstacle:
-            out = out * fluid
+            out = out * fluid  # broadcast over 3
 
-        loss = step_loss_sum(out, y, fluid)
+        loss = l2_loss(out, y) if args.no_mask_loss else masked_l2_loss(out, y, fluid)
         loss.backward()
         optimizer.step()
         break
@@ -551,30 +529,29 @@ while cur_total_time <= train_budget:
             else:
                 win = yy[..., t - T_in:t, :]
 
-            inp = win.reshape(B, win.shape[1], win.shape[2], 3 * T_in)
-            inp = torch.cat([inp, mask], dim=-1)
-
+            inp = win.reshape(B, win.shape[1], win.shape[2], 3 * T_in)  # (B,H,W,3*T_in)
+            inp = torch.cat([inp, mask], dim=-1)                        # (B,H,W,3*T_in+1)
             if noise_std > 0:
                 inp = inp + noise_std * torch.randn_like(inp)
 
-            y = yy[..., t, :]
+            y = yy[..., t, :]                                           # (B,H,W,3)
 
             t_step_s = time.time()
-            out = model(inp)['forecast']
+            out = model(inp)['forecast']                                # (B,H,W,3)
             if args.zero_pred_in_obstacle:
                 out = out * fluid
 
-            loss = step_loss_sum(out, y, fluid)
+            loss = l2_loss(out, y) if args.no_mask_loss else masked_l2_loss(out, y, fluid)
             loss.backward()
             optimizer.step()
             scheduler.step()
 
             step_time = time.time() - t_step_s
 
-            print(f"step time: {step_time}")
+            # print(f"  step time: {step_time:.4f}s, loss: {loss.item():.6f}")
 
             cur_total_time += step_time
-            train_loss_sum += float(loss.item())  # batch-sum scalar
+            train_loss_sum += float(loss.item())
 
             if cur_total_time > train_budget:
                 break
@@ -583,7 +560,7 @@ while cur_total_time <= train_budget:
             break
 
     if (ep % 10 == 0) or (cur_total_time > train_budget):
-        denom = max(1, trained_data) * T  # since train_loss_sum is batch-sums over t
+        denom = max(1, trained_data) * T
         wandb.log({
             "epoch": ep,
             "step": scheduler.last_epoch,
@@ -603,7 +580,6 @@ while cur_total_time <= train_budget:
             "train_time": cur_total_time,
         }
         torch.save(ckpt_out, local_ckpt)
-        shutil.copy(local_ckpt, os.path.join(home_path, args.save, "model"))
 
 # Save final model
 final_model_path = os.path.join(args.save, "model", output_path)
@@ -618,7 +594,6 @@ print("Start evaluation...")
 model.eval()
 
 val_step_loss_sum = 0.0
-val_samples = 0
 worst_loss = -math.inf
 worst_idx = -1
 global_base = 0
@@ -626,39 +601,40 @@ global_base = 0
 with torch.no_grad():
     for xx, yy, mask in val_loader:
         B = xx.shape[0]
-        val_samples += B
 
-        window = xx[..., :T_in, :]  # CPU
-        mask_cpu = mask             # CPU
+        # keep window on CPU like your original eval
+        window = xx[..., :T_in, :]     # (B,H,W,T_in,3) on CPU
+        mask_cpu = mask               # (B,H,W,1) on CPU
 
         preds_list = []
         for t in range(T):
-            win_d = window.contiguous().to(device, non_blocking=True)
-            mask_d = mask_cpu.contiguous().to(device, non_blocking=True)
-            fluid_d = to_fluid_mask(mask_d)
+            win_d = window.contiguous().to(device, non_blocking=True)        # (B,H,W,T_in,3)
+            mask_d = mask_cpu.contiguous().to(device, non_blocking=True)     # (B,H,W,1)
+            fluid_d = to_fluid_mask(mask_d)                                  # (B,H,W,1)
 
-            inp = win_d.reshape(B, win_d.shape[1], win_d.shape[2], 3 * T_in)
-            inp = torch.cat([inp, mask_d], dim=-1)
+            inp = win_d.reshape(B, win_d.shape[1], win_d.shape[2], 3 * T_in) # (B,H,W,3*T_in)
+            inp = torch.cat([inp, mask_d], dim=-1)                           # (B,H,W,3*T_in+1)
 
-            out = model(inp)['forecast']
+            out = model(inp)['forecast']                                     # (B,H,W,3)
             if args.zero_pred_in_obstacle:
                 out = out * fluid_d
 
-            y = yy[..., t, :].contiguous().to(device, non_blocking=True)
+            y = yy[..., t, :].contiguous().to(device, non_blocking=True)     # (B,H,W,3)
+            step_loss = l2_loss(out, y) if args.no_mask_loss else masked_l2_loss(out, y, fluid_d)
+            val_step_loss_sum += float(step_loss.item())
 
-            step_loss = step_loss_sum(out, y, fluid_d)     # batch-sum scalar
-            val_step_loss_sum += float(step_loss.item())   # accumulate batch-sums
-
-            out_cpu = out.detach().cpu().unsqueeze(-2)
+            out_cpu = out.detach().cpu().unsqueeze(-2)                       # (B,H,W,1,3)
             preds_list.append(out_cpu)
 
+            # shift window: drop oldest frame, append new pred as last frame
+            # window is (B,H,W,T_in,3), out_cpu is (B,H,W,1,3)
             window = torch.cat([window[..., 1:, :], out_cpu], dim=-2)
 
             del win_d, out, y, mask_d, fluid_d, inp
 
-        preds = torch.cat(preds_list, dim=-2)  # (B,H,W,T,3)
+        preds = torch.cat(preds_list, dim=-2)                                # (B,H,W,T,3)
 
-        fluid_cpu = to_fluid_mask(mask_cpu) if not args.no_mask_loss else None
+        fluid_cpu = to_fluid_mask(mask_cpu) if not args.no_mask_loss else None  # (B,H,W,1) or None
         per_sample = traj_l2(preds, yy, fluid=fluid_cpu) / T
         # per_sample = traj_rel_l2(preds, yy, fluid=fluid_cpu)
 
@@ -672,7 +648,7 @@ with torch.no_grad():
 
         global_base += B
 
-val_step_loss = val_step_loss_sum / (max(1, val_samples) * T)
+val_step_loss = val_step_loss_sum / (ntest * T)
 
 wandb.log({
     "worst_l2_loss": worst_loss,
