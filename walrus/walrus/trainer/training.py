@@ -62,11 +62,16 @@ def _check_finite(name: str, x, throw: bool = True):
         if not ok:
             with torch.no_grad():
                 bad = (~torch.isfinite(x)).nonzero(as_tuple=False)[:10]
-                mn = torch.nanmin(x).item() if x.numel() else float("nan")
-                mx = torch.nanmax(x).item() if x.numel() else float("nan")
+                finite = x[torch.isfinite(x)]
+                mn = finite.min().item() if finite.numel() else float("nan")
+                mx = finite.max().item() if finite.numel() else float("nan")
                 msg = (
                     f"[NONFINITE] {name} shape={tuple(x.shape)} dtype={x.dtype} "
-                    f"device={x.device} min={mn} max={mx} bad_idx={bad.tolist()}"
+                    f"device={x.device} min_finite={mn} max_finite={mx} "
+                    f"nan={torch.isnan(x).sum().item()} "
+                    f"posinf={torch.isposinf(x).sum().item()} "
+                    f"neginf={torch.isneginf(x).sum().item()} "
+                    f"bad_idx={bad.tolist()}"
                 )
             if throw:
                 raise RuntimeError(msg)
@@ -92,6 +97,164 @@ class RelativeL2(Metric):
 
         rel = torch.sqrt(diff2 + eps) / (torch.sqrt(ref2 + eps))       # (B,T,C)
         return {self.name: rel}
+
+
+def _canonical_multi_obstacle_field_name(name: str) -> str | None:
+    normalized = str(name).lower().replace(" ", "_")
+    aliases = {
+        "vorticity": "vorticity",
+        "omega": "vorticity",
+        "velocity_x": "velocity_x",
+        "velocity_0": "velocity_x",
+        "velocity_x_0": "velocity_x",
+        "vx": "velocity_x",
+        "velx": "velocity_x",
+        "velocity_y": "velocity_y",
+        "velocity_1": "velocity_y",
+        "velocity_y_0": "velocity_y",
+        "vy": "velocity_y",
+        "vely": "velocity_y",
+        "pressure": "pressure",
+        "p": "pressure",
+    }
+    return aliases.get(normalized)
+
+
+def _time_avg_nrmse_per_sample(pred, ref, eps=1e-12):
+    batch_size = pred.shape[0]
+    numerator = (pred - ref).reshape(batch_size, -1).float().pow(2).sum(dim=1)
+    denominator = ref.reshape(batch_size, -1).float().pow(2).sum(dim=1).clamp_min(eps)
+    return torch.sqrt(numerator / denominator)
+
+
+def _flip_multi_obstacle_fields(fields, names):
+    """Reflect B,...,C fields across the final spatial axis."""
+    flipped = torch.flip(fields, dims=[-2])
+    for channel_idx, name in enumerate(names):
+        if name in {"vorticity", "velocity_x"}:
+            flipped[..., channel_idx] *= -1.0
+    return flipped
+
+
+def multi_obstacle_time_avg_scores(
+    predictions,
+    references,
+    field_names,
+    *,
+    last_n=160,
+):
+    """Return Poseidon-style per-trajectory flip/no-flip time-average NRMSE."""
+    # Walrus validation tensors are B,T,[spatial...],C and are already in physical units.
+    k = min(int(last_n), predictions.shape[1], references.shape[1])
+    if k <= 0:
+        return {}
+
+    canonical_to_index = {}
+    for channel_idx, field_name in enumerate(field_names):
+        canonical_name = _canonical_multi_obstacle_field_name(field_name)
+        if canonical_name is not None and canonical_name not in canonical_to_index:
+            canonical_to_index[canonical_name] = channel_idx
+
+    groups = {
+        quantity: [quantity]
+        for quantity in ["vorticity", "velocity_x", "velocity_y", "pressure"]
+        if quantity in canonical_to_index
+    }
+    if {"velocity_x", "velocity_y"}.issubset(canonical_to_index):
+        groups["velocity"] = ["velocity_x", "velocity_y"]
+    if {"velocity_x", "velocity_y", "pressure"}.issubset(canonical_to_index):
+        groups["vxvyp"] = ["velocity_x", "velocity_y", "pressure"]
+    if canonical_to_index:
+        groups["all_fields"] = [
+            quantity
+            for quantity in ["vorticity", "velocity_x", "velocity_y", "pressure"]
+            if quantity in canonical_to_index
+        ]
+
+    pred_avg = predictions[:, -k:].float().mean(dim=1)
+    ref_avg = references[:, -k:].float().mean(dim=1)
+    scores = {}
+    for group_name, names in groups.items():
+        indices = [canonical_to_index[name] for name in names]
+        pred_fields = pred_avg[..., indices]
+        ref_fields = ref_avg[..., indices]
+        scores[f"tavg_flip_{group_name}"] = _time_avg_nrmse_per_sample(
+            pred_fields + _flip_multi_obstacle_fields(pred_fields, names),
+            ref_fields + _flip_multi_obstacle_fields(ref_fields, names),
+        )
+        scores[f"tavg_noflip_{group_name}"] = _time_avg_nrmse_per_sample(
+            pred_fields, ref_fields
+        )
+    return scores
+
+
+def channelwise_physical_nrmse(
+    predictions,
+    references,
+    field_names,
+    *,
+    fluid_mask=None,
+    eps=1e-12,
+):
+    """Return B,C physical-unit rollout nRMSE for Walrus validation tensors."""
+    pred = predictions.float().clone()
+    ref = references.float().clone()
+    if fluid_mask is None:
+        fluid = torch.ones(
+            pred.shape[0],
+            *pred.shape[2:-1],
+            device=pred.device,
+            dtype=pred.dtype,
+        )
+    else:
+        fluid = fluid_mask.to(device=pred.device, dtype=pred.dtype)
+        fluid = (fluid > 0.5).to(pred.dtype)
+
+    while fluid.ndim < pred.ndim - 1:
+        fluid = fluid.unsqueeze(1)
+    weight = fluid.unsqueeze(-1)
+    spatial_dims = tuple(range(2, pred.ndim - 1))
+
+    for channel_idx, field_name in enumerate(field_names):
+        if _canonical_multi_obstacle_field_name(field_name) != "pressure":
+            continue
+        pressure_weight = weight[..., 0]
+        pressure_count = pressure_weight.sum(
+            dim=spatial_dims, keepdim=True
+        ).clamp_min(1.0)
+        pred[..., channel_idx] -= (
+            (pred[..., channel_idx] * pressure_weight).sum(
+                dim=spatial_dims, keepdim=True
+            )
+            / pressure_count
+        )
+        ref[..., channel_idx] -= (
+            (ref[..., channel_idx] * pressure_weight).sum(
+                dim=spatial_dims, keepdim=True
+            )
+            / pressure_count
+        )
+
+    reduction_dims = tuple(range(1, pred.ndim - 1))
+    numerator = ((pred - ref).square() * weight).sum(dim=reduction_dims)
+    denominator = (ref.square() * weight).sum(
+        dim=reduction_dims
+    ).clamp_min(eps)
+    return torch.sqrt(numerator / denominator)
+
+
+def _breakflow_fluid_mask(batch, metadata, device):
+    """Extract the raw BreakFlow mask, whose convention is 1=fluid."""
+    constant_names = metadata.constant_field_names[0]
+    if "mask" not in constant_names:
+        return None
+    mask_index = constant_names.index("mask")
+    return batch["constant_fields"][..., mask_index].to(
+        device=device,
+        dtype=torch.float32,
+        non_blocking=True,
+    )
+
 
 def _safe_gaussian_kde(x):
     """Return a callable kde(t) or None if scipy isn't available."""
@@ -308,7 +471,6 @@ class Trainer:
         big_batch_multiplier: int = 1,
         big_batch_before: int = 0,
         clip_gradient: float = 0.0,
-        use_autoregressive: bool = False,
         loss_multiplier: float = 1.0,
         minimum_context: int = 1,
         validation_full_trajectory_ensemble_size: int = 1,
@@ -332,7 +494,7 @@ class Trainer:
         time_budget_s: Optional[float] = None,   # total budget in seconds (includes one-time data gen cost)
         gen_time_s: float = 0.0,                 # seconds per generated trajectory/sample (one-time)
         Ndata_generated: Optional[int] = None,   # fixed up-front #trajectories/samples generated
-        save_path: Optional[str] = ".",
+        save_path: Optional[str] = None,
     ):
         """
         Class in charge of the training loop. It performs train, validation and test.
@@ -477,7 +639,6 @@ class Trainer:
         self.big_batch_multiplier = big_batch_multiplier
         self.big_batch_before = big_batch_before
         self.clip_gradient = clip_gradient
-        self.use_autoregressive = use_autoregressive
         self.loss_multiplier = loss_multiplier
         self.minimum_context = minimum_context
         self.validation_full_trajectory_ensemble_size = (
@@ -544,7 +705,9 @@ class Trainer:
 
         self.time_budget_s = None if time_budget_s is None else float(time_budget_s)
         self.gen_time_s = float(gen_time_s)
-        self.save_path = save_path
+        self.save_path = save_path or os.path.join(
+            os.environ.get("MODEL_STORAGE_ROOT", "checkpoints"), "walrus"
+        )
 
         if Ndata_generated is not None:
             self.Ndata_generated = int(Ndata_generated)
@@ -604,7 +767,15 @@ class Trainer:
         )
         return checkpoint_future
 
-    def rollout_model(self, model, batch, formatter, train=True, fake_pass=False):
+    def rollout_model(
+        self,
+        model,
+        batch,
+        formatter,
+        train=True,
+        fake_pass=False,
+        full_rollout=False,
+    ):
         """Rollout the model for as many steps as we have data for.
         predict_normalized: bool - If true, output normalized prediction. During one-step training,
             predict normalized values to reduce precision issues/extra FLOPs. During rollout,
@@ -627,6 +798,10 @@ class Trainer:
             mask_index = batch["metadata"].constant_field_names[0].index("mask")
             mask = batch["constant_fields"][..., mask_index : mask_index + 1]
             mask = mask.to(self.device, dtype=torch.bool, non_blocking=True)
+            if metadata.dataset_name.lower() == "breakflow":
+                # PyFR/Analyze uses 1 for fluid and 0 for an obstacle, whereas
+                # Walrus expects True to identify values that should be hidden.
+                mask = ~mask
         else:
             mask = None
 
@@ -649,7 +824,9 @@ class Trainer:
         # Inputs T B C H [W D], y_ref B T H [W D] C
         # If causal, during training don't include initial context in rollout length
         T_in = batch["input_fields"].shape[1]
-        if model.causal_in_time:
+        if full_rollout:
+            max_rollout_steps = y_ref.shape[1]
+        elif model.causal_in_time:
             max_rollout_steps = self.max_rollout_steps + (T_in - 1)
         else:
             max_rollout_steps = self.max_rollout_steps
@@ -1508,6 +1685,10 @@ class Trainer:
                             self.formatter_dict[dset_name],
                             train=False,
                             fake_pass=(rank_assignment != self.sync_group_rank),
+                            full_rollout=(
+                                dset_name.lower() == "breakflow"
+                                and valid_or_test in ("test", "rollout_test")
+                            ),
                         )
                         t1 = time.time()
 
@@ -1545,6 +1726,66 @@ class Trainer:
                     used_field_names = [
                         f for ii, f in enumerate(field_names) if batch["padded_field_mask"][ii]
                     ]
+
+                    if dset_name.lower() == "breakflow":
+                        physical_batch_scores = channelwise_physical_nrmse(
+                            y_pred,
+                            y_ref,
+                            used_field_names,
+                            fluid_mask=_breakflow_fluid_mask(
+                                batch,
+                                current_metadata,
+                                y_pred.device,
+                            ),
+                            eps=self.validation_epsilon,
+                        )
+                        for channel_idx, field_name in enumerate(used_field_names):
+                            canonical_name = (
+                                _canonical_multi_obstacle_field_name(field_name)
+                                or str(field_name)
+                            )
+                            if canonical_name == "pressure":
+                                canonical_name = "pressure_gauge_centered"
+                            loss_name = (
+                                f"{dset_name}/channelwise_physical_nrmse/"
+                                f"{canonical_name}"
+                            )
+                            channel_scores = (
+                                physical_batch_scores[:, channel_idx].detach().cpu()
+                            )
+                            if loss_name in rank_loss_dict:
+                                rank_loss_dict[loss_name] = torch.cat(
+                                    [rank_loss_dict[loss_name], channel_scores], dim=0
+                                )
+                            else:
+                                rank_loss_dict[loss_name] = channel_scores
+
+                        macro_loss_name = (
+                            f"{dset_name}/channelwise_physical_nrmse_macro"
+                        )
+                        macro_scores = physical_batch_scores.mean(dim=1).detach().cpu()
+                        if macro_loss_name in rank_loss_dict:
+                            rank_loss_dict[macro_loss_name] = torch.cat(
+                                [rank_loss_dict[macro_loss_name], macro_scores], dim=0
+                            )
+                        else:
+                            rank_loss_dict[macro_loss_name] = macro_scores
+
+                        time_avg_batch_scores = multi_obstacle_time_avg_scores(
+                            y_pred,
+                            y_ref,
+                            used_field_names,
+                            last_n=160,
+                        )
+                        for score_name, batch_scores in time_avg_batch_scores.items():
+                            loss_name = f"{dset_name}/{score_name}_nrmse"
+                            batch_scores = batch_scores.detach().cpu()
+                            if loss_name in rank_loss_dict:
+                                rank_loss_dict[loss_name] = torch.cat(
+                                    [rank_loss_dict[loss_name], batch_scores], dim=0
+                                )
+                            else:
+                                rank_loss_dict[loss_name] = batch_scores
 
                     # Iterate through all validation metrics and log them.
                     vrmse = float("nan")
@@ -1776,6 +2017,51 @@ class Trainer:
                     )
                     wandb.save(npz_path, base_path=self.viz_folder)
 
+            time_avg_wandb = {}
+            for loss_name, values in loss_dict.items():
+                marker = "/tavg_"
+                if marker not in loss_name or not loss_name.endswith("_nrmse"):
+                    continue
+                _, score_name = loss_name.split(marker, 1)
+                mode, quantity = score_name[:-len("_nrmse")].split("_", 1)
+                mean_score = (
+                    values.float().mean().item()
+                    if isinstance(values, torch.Tensor)
+                    else float(np.asarray(values).mean())
+                )
+                time_avg_wandb[f"test/{quantity}/tavg_{mode}_nrmse"] = mean_score
+
+            if time_avg_wandb:
+                logger.info(
+                    "Multi-obstacle time-average statistics (last 160 rollout frames): %s",
+                    time_avg_wandb,
+                )
+                if self.wandb_logging:
+                    wandb.log(time_avg_wandb, commit=False)
+
+            physical_nrmse_wandb = {}
+            for loss_name, values in loss_dict.items():
+                marker = "/channelwise_physical_nrmse/"
+                if marker in loss_name:
+                    channel_name = loss_name.split(marker, 1)[1]
+                    physical_nrmse_wandb[
+                        f"test/channelwise_physical_nrmse/{channel_name}"
+                    ] = values.float().mean().item()
+                elif loss_name.endswith("/channelwise_physical_nrmse_macro"):
+                    macro_score = values.float().mean().item()
+                    physical_nrmse_wandb[
+                        "test/channelwise_physical_nrmse_macro"
+                    ] = macro_score
+                    physical_nrmse_wandb["test/nrmse"] = macro_score
+
+            if physical_nrmse_wandb:
+                logger.info(
+                    "Channelwise physical-unit nRMSE: %s",
+                    physical_nrmse_wandb,
+                )
+                if self.wandb_logging:
+                    wandb.log(physical_nrmse_wandb, commit=False)
+
         # Single score validation loss is average of all losses on the training metric
         validation_loss = sum(
             [
@@ -1955,10 +2241,16 @@ class Trainer:
 
                     if not torch.isfinite(loss):
                         logger.error("[NAN_DEBUG] loss is non-finite on epoch=%d batch=%d dset=%s", epoch, i, dset_name)
-                        # optional: re-run a few finiteness checks before tensors are deleted
-                        # _check_finite("y_pred (train)", y_pred, throw=False)
-                        # _check_finite("y_ref  (train)", y_ref,  throw=False)
-                        # if you want to hard-crash immediately:
+                        _check_finite("y_pred (train)", y_pred, throw=False)
+                        _check_finite("y_ref (train)", y_ref, throw=False)
+                        for parameter_name, parameter in self.model.named_parameters():
+                            if not torch.isfinite(parameter).all():
+                                _check_finite(
+                                    f"model parameter {parameter_name}",
+                                    parameter,
+                                    throw=False,
+                                )
+                                break
                         raise RuntimeError("Loss became NaN/Inf (see logs above)")
 
                     del y_pred, y_ref
@@ -2606,17 +2898,31 @@ class Trainer:
                 )
 
         if self.rank == 0:
-            out = self.save_path + f"B{int(self.time_budget_s)}_N{int(self.Ndata_generated)}.pt"
-            os.makedirs(os.path.dirname(out), exist_ok=True)
+            budget_label = (
+                "unlimited"
+                if self.time_budget_s is None
+                else str(int(self.time_budget_s))
+            )
+            out = os.path.join(
+                self.save_path,
+                f"B{budget_label}_N{int(self.Ndata_generated)}.pt",
+            )
+            os.makedirs(self.save_path, exist_ok=True)
+            checkpoint = {
+                "model": self.model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "epoch": epoch,
+                "train_compute_time": self.train_compute_time_s,
+            }
+            if self.lr_scheduler is not None:
+                checkpoint["lr_scheduler"] = self.lr_scheduler.state_dict()
             torch.save(
-                {
-                    "model": self.model.state_dict(),
-                    "optimizer": self.optimizer.state_dict(),
-                    "epoch": epoch,
-                },
+                checkpoint,
                 out,
             )
             logger.info(f"[SAVE] Saved final checkpoint to {out}")
+            if self.wandb_logging and wandb.run is not None:
+                wandb.run.summary["checkpoint_path"] = out
 
         # Do test validation
         test_dataloaders = self.datamodule.test_dataloaders(
