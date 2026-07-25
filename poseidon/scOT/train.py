@@ -16,6 +16,8 @@ accelerate launch scOT/train.py
 """
 
 import argparse
+import base64
+import io
 import torch
 import wandb
 import numpy as np
@@ -35,6 +37,7 @@ import matplotlib.pyplot as plt
 import transformers
 from accelerate.utils import broadcast_object_list
 from scOT.trainer import TrainingArguments, Trainer
+from transformers.trainer_utils import get_last_checkpoint
 from transformers import EarlyStoppingCallback
 from scOT.model import ScOT, ScOTConfig
 from mpl_toolkits.axes_grid1 import ImageGrid
@@ -47,6 +50,13 @@ SEED = 0
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
+
+
+def nrmse(pred: np.ndarray, ref: np.ndarray) -> float:
+    denom = np.square(ref).sum()
+    if denom == 0:
+        denom = 1e-10
+    return float(np.sqrt(np.square(pred - ref).sum() / denom))
 
 
 MODEL_MAP = {
@@ -89,30 +99,39 @@ MODEL_MAP = {
 }
 
 
-def create_predictions_plot(predictions, labels, wandb_prefix):
-    assert predictions.shape[0] >= 4
+def _create_predictions_figure(predictions, labels, indices=None, value_range=None):
+    if predictions.ndim == 5:
+        predictions = predictions[:, 0]
+    if labels.ndim == 5:
+        labels = labels[:, 0]
 
-    indices = random.sample(range(predictions.shape[0]), 4)
+    if indices is None:
+        indices = list(range(min(4, predictions.shape[0])))
+    else:
+        indices = list(indices)[:4]
 
     predictions = predictions[indices]
     labels = labels[indices]
 
-    fig = plt.figure()
+    fig = plt.figure(figsize=(7.0, 6.0))
     grid = ImageGrid(
-        fig, 111, nrows_ncols=(predictions.shape[1] + labels.shape[1], 4), axes_pad=0.1
+        fig, 111, nrows_ncols=(predictions.shape[1] * 2, 4), axes_pad=0.1
     )
 
-    vmax, vmin = max(predictions.max(), labels.max()), min(
-        predictions.min(), labels.min()
-    )
+    if value_range is None:
+        vmax, vmin = max(predictions.max(), labels.max()), min(
+            predictions.min(), labels.min()
+        )
+    else:
+        vmin, vmax = value_range
 
     for _i, ax in enumerate(grid):
         i = _i // 4
         j = _i % 4
 
-        if i % 2 == 0:
+        if i < predictions.shape[1]:
             ax.imshow(
-                predictions[j, i // 2, :, :],
+                predictions[j, i, :, :],
                 cmap="gist_ncar",
                 origin="lower",
                 vmin=vmin,
@@ -120,7 +139,7 @@ def create_predictions_plot(predictions, labels, wandb_prefix):
             )
         else:
             ax.imshow(
-                labels[j, i // 2, :, :],
+                labels[j, i - predictions.shape[1], :, :],
                 cmap="gist_ncar",
                 origin="lower",
                 vmin=vmin,
@@ -130,8 +149,80 @@ def create_predictions_plot(predictions, labels, wandb_prefix):
         ax.set_xticks([])
         ax.set_yticks([])
 
+    fig.text(0.02, 0.75, "Prediction", rotation=90, va="center", ha="left", fontsize=10)
+    fig.text(0.02, 0.25, "Ground Truth", rotation=90, va="center", ha="left", fontsize=10)
+
+    return fig
+
+
+def create_predictions_plot(predictions, labels, wandb_prefix):
+    fig = _create_predictions_figure(predictions, labels)
     wandb.log({wandb_prefix + "/predictions": wandb.Image(fig)})
-    plt.close()
+    plt.close(fig)
+
+
+def _figure_to_data_uri(fig) -> str:
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight", dpi=105)
+    plt.close(fig)
+    buffer.seek(0)
+    encoded = base64.b64encode(buffer.read()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _build_step_slider_html(step_data_uris, step_indices, title: str) -> str:
+    images_json = json.dumps(step_data_uris)
+    steps_json = json.dumps([int(s) for s in step_indices])
+    first_step = int(step_indices[0]) if len(step_indices) > 0 else 0
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset=\"utf-8\" />
+    <style>
+        body {{ font-family: sans-serif; margin: 0; padding: 0; }}
+        .wrap {{ max-width: 980px; margin: 0 auto; padding: 8px 12px; }}
+        .title {{ font-size: 18px; margin-bottom: 8px; text-align: center; }}
+        .meta {{ display: flex; justify-content: space-between; align-items: center; margin: 6px 0 10px 0; }}
+        .step-label {{ font-size: 16px; }}
+        img {{ width: min(880px, 100%); height: auto; display: block; margin: 0 auto; border: 0; }}
+        input[type=range] {{ width: 100%; }}
+    </style>
+</head>
+<body>
+    <div class=\"wrap\">
+        <div class=\"title\">{title}</div>
+        <img id=\"rollout-image\" src=\"\" alt=\"rollout step\" />
+        <div class=\"meta\">
+            <div class=\"step-label\">Step <span id=\"step-value\">{first_step}</span></div>
+        </div>
+        <input id=\"step-slider\" type=\"range\" min=\"0\" max=\"{max(len(step_data_uris) - 1, 0)}\" value=\"0\" step=\"1\" />
+    </div>
+    <script>
+        const images = {images_json};
+        const steps = {steps_json};
+        const slider = document.getElementById('step-slider');
+        const img = document.getElementById('rollout-image');
+        const stepValue = document.getElementById('step-value');
+
+        function setStep(idx) {{
+            const clamped = Math.max(0, Math.min(idx, images.length - 1));
+            img.src = images[clamped];
+            stepValue.textContent = steps[clamped];
+            slider.value = clamped;
+        }}
+
+        slider.addEventListener('input', (event) => {{
+            setStep(parseInt(event.target.value, 10));
+        }});
+
+        if (images.length > 0) {{
+            setStep(0);
+        }}
+    </script>
+</body>
+</html>
+"""
 
 def _smooth_1d(counts: np.ndarray, sigma_bins: float = 2.0) -> np.ndarray:
     """
@@ -189,6 +280,263 @@ def per_traj_relative_l2(preds: torch.Tensor, labels: torch.Tensor, eps: float =
 
     finite_mask = torch.isfinite(rel_l2)
     return rel_l2, finite_mask
+
+
+def _multi_obstacle_flip(field: np.ndarray, quantity: str) -> np.ndarray:
+    flipped = np.flip(np.array(field, copy=True), axis=-1)
+    if quantity == "velocity_x":
+        flipped *= -1.0
+    return flipped
+
+
+def _denormalize_multi_obstacle_rollout(
+    rollout: np.ndarray, mean: np.ndarray, std: np.ndarray
+) -> np.ndarray:
+    mean = np.asarray(mean, dtype=np.float32).reshape(1, 1, -1, 1, 1)
+    std = np.asarray(std, dtype=np.float32).reshape(1, 1, -1, 1, 1)
+    return rollout * std + mean
+
+
+def _multi_obstacle_fluid_masks(dataset, num_trajectories: int) -> np.ndarray:
+    """Return N,H,W masks using the dataset's configured mask convention."""
+    raw = np.asarray(dataset._mask)
+    raw = np.squeeze(raw)
+    if raw.ndim == 2:
+        raw = np.repeat(raw[None], num_trajectories, axis=0)
+    if raw.ndim != 3 or raw.shape[0] < num_trajectories:
+        raise ValueError(
+            f"Expected at least {num_trajectories} masks shaped N,H,W, got {raw.shape}"
+        )
+    raw = raw[:num_trajectories] > 0.5
+    if bool(getattr(dataset, "mask_is_obstacle_true", True)):
+        return (~raw).astype(np.float64)
+    return raw.astype(np.float64)
+
+
+def _channelwise_physical_nrmse_multi_obstacle(
+    predictions: np.ndarray,
+    references: np.ndarray,
+    fluid_masks: np.ndarray,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """Return N,3 rollout nRMSE in physical units for vx, vy, and pressure."""
+    pred = np.asarray(predictions[:, :, :3], dtype=np.float64).copy()
+    ref = np.asarray(references[:, :, :3], dtype=np.float64).copy()
+    weight = np.asarray(fluid_masks, dtype=np.float64)[:, None, None]
+
+    pressure_weight = weight[:, :, 0]
+    pressure_count = pressure_weight.sum(
+        axis=(-2, -1), keepdims=True
+    ).clip(min=1.0)
+    pred[:, :, 2] -= (
+        (pred[:, :, 2] * pressure_weight).sum(
+            axis=(-2, -1), keepdims=True
+        )
+        / pressure_count
+    )
+    ref[:, :, 2] -= (
+        (ref[:, :, 2] * pressure_weight).sum(
+            axis=(-2, -1), keepdims=True
+        )
+        / pressure_count
+    )
+
+    numerator = (np.square(pred - ref) * weight).sum(axis=(1, 3, 4))
+    denominator = (np.square(ref) * weight).sum(axis=(1, 3, 4))
+    return np.sqrt(numerator / np.maximum(denominator, eps))
+
+
+def _extract_multi_obstacle_reference_rollout(dataset, rollout_steps: int) -> np.ndarray:
+    history = int(getattr(dataset, "history", 5))
+    frame_axis = 1 if getattr(dataset, "_layout", "NTHW") == "NTHW" else 3
+    total_frames = int(dataset._vx.shape[frame_axis])
+    rollout_steps = min(int(rollout_steps), total_frames - history)
+    if rollout_steps <= 0:
+        raise ValueError(
+            f"Cannot extract a rollout with history={history} from a trajectory with {total_frames} frames."
+        )
+
+    refs = []
+    for traj_id in range(int(dataset._num_traj_total)):
+        _, local_idx = dataset._traj_to_file_local(int(traj_id))
+        traj = []
+        for t in range(history, history + rollout_steps):
+            vx = dataset._get_frame(dataset._vx, local_idx, t)
+            vy = dataset._get_frame(dataset._vy, local_idx, t)
+            p = dataset._get_frame(dataset._p, local_idx, t)
+            traj.append(torch.stack([vx, vy, p], dim=0))
+        refs.append(torch.stack(traj, dim=0))
+
+    return torch.stack(refs, dim=0).cpu().numpy()
+
+
+def _compute_multi_obstacle_time_avg_stats(
+    predictions: np.ndarray,
+    references: np.ndarray,
+    *,
+    last_n: int = 160,
+) -> dict:
+    quantities = ["velocity_x", "velocity_y", "pressure"]
+
+    def _flip_stacked_fields(field_stack: np.ndarray, names) -> np.ndarray:
+        out = np.array(field_stack, copy=True)
+        for idx, name in enumerate(names):
+            out[idx] = _multi_obstacle_flip(out[idx], name)
+        return out
+
+    last_n = min(int(last_n), predictions.shape[1], references.shape[1])
+    if last_n <= 0:
+        raise ValueError("last_n must be positive.")
+
+    stats = {}
+    for channel_idx, quantity in enumerate(quantities):
+        flip_scores = []
+        noflip_scores = []
+        for traj_idx in range(predictions.shape[0]):
+            pred_avg = predictions[traj_idx, -last_n:, channel_idx].mean(axis=0)
+            ref_avg = references[traj_idx, -last_n:, channel_idx].mean(axis=0)
+
+            flip_scores.append(
+                nrmse(
+                    pred_avg + _multi_obstacle_flip(pred_avg, quantity),
+                    ref_avg + _multi_obstacle_flip(ref_avg, quantity),
+                )
+            )
+            noflip_scores.append(nrmse(pred_avg, ref_avg))
+
+        flip_scores = np.asarray(flip_scores, dtype=np.float64)
+        noflip_scores = np.asarray(noflip_scores, dtype=np.float64)
+        stats[f"tavg_flip_{quantity}"] = float(np.mean(flip_scores))
+        stats[f"tavg_noflip_{quantity}"] = float(np.mean(noflip_scores))
+        stats[f"worst_tavg_flip_{quantity}"] = float(np.max(flip_scores))
+        stats[f"worst_tavg_noflip_{quantity}"] = float(np.max(noflip_scores))
+        stats[f"worst_tavg_flip_{quantity}_traj_idx"] = int(np.argmax(flip_scores))
+        stats[f"worst_tavg_noflip_{quantity}_traj_idx"] = int(np.argmax(noflip_scores))
+
+    velocity_names = ["velocity_x", "velocity_y"]
+    flip_scores_velocity = []
+    noflip_scores_velocity = []
+    flip_scores_all = []
+    noflip_scores_all = []
+
+    for traj_idx in range(predictions.shape[0]):
+        pred_avg_all = predictions[traj_idx, -last_n:, :].mean(axis=0)
+        ref_avg_all = references[traj_idx, -last_n:, :].mean(axis=0)
+
+        pred_avg_velocity = pred_avg_all[:2]
+        ref_avg_velocity = ref_avg_all[:2]
+
+        flip_scores_velocity.append(
+            nrmse(
+                pred_avg_velocity + _flip_stacked_fields(pred_avg_velocity, velocity_names),
+                ref_avg_velocity + _flip_stacked_fields(ref_avg_velocity, velocity_names),
+            )
+        )
+        noflip_scores_velocity.append(nrmse(pred_avg_velocity, ref_avg_velocity))
+
+        flip_scores_all.append(
+            nrmse(
+                pred_avg_all + _flip_stacked_fields(pred_avg_all, quantities),
+                ref_avg_all + _flip_stacked_fields(ref_avg_all, quantities),
+            )
+        )
+        noflip_scores_all.append(nrmse(pred_avg_all, ref_avg_all))
+
+    flip_scores_velocity = np.asarray(flip_scores_velocity, dtype=np.float64)
+    noflip_scores_velocity = np.asarray(noflip_scores_velocity, dtype=np.float64)
+    flip_scores_all = np.asarray(flip_scores_all, dtype=np.float64)
+    noflip_scores_all = np.asarray(noflip_scores_all, dtype=np.float64)
+
+    stats["tavg_flip_velocity"] = float(np.mean(flip_scores_velocity))
+    stats["tavg_noflip_velocity"] = float(np.mean(noflip_scores_velocity))
+    stats["tavg_flip_all_fields"] = float(np.mean(flip_scores_all))
+    stats["tavg_noflip_all_fields"] = float(np.mean(noflip_scores_all))
+    stats["worst_tavg_flip_velocity"] = float(np.max(flip_scores_velocity))
+    stats["worst_tavg_noflip_velocity"] = float(np.max(noflip_scores_velocity))
+    stats["worst_tavg_flip_all_fields"] = float(np.max(flip_scores_all))
+    stats["worst_tavg_noflip_all_fields"] = float(np.max(noflip_scores_all))
+    stats["worst_tavg_flip_velocity_traj_idx"] = int(np.argmax(flip_scores_velocity))
+    stats["worst_tavg_noflip_velocity_traj_idx"] = int(np.argmax(noflip_scores_velocity))
+    stats["worst_tavg_flip_all_fields_traj_idx"] = int(np.argmax(flip_scores_all))
+    stats["worst_tavg_noflip_all_fields_traj_idx"] = int(np.argmax(noflip_scores_all))
+
+    return stats
+
+
+def _compute_rollout_temporal_diagnostics(
+    predictions: np.ndarray,
+    references: np.ndarray,
+) -> dict:
+    steps = min(int(predictions.shape[1]), int(references.shape[1]))
+    if steps <= 1:
+        return {
+            "pred_mean_step_delta": 0.0,
+            "ref_mean_step_delta": 0.0,
+            "pred_first_last_delta": 0.0,
+            "ref_first_last_delta": 0.0,
+            "pred_ref_step_delta_ratio": 0.0,
+        }
+
+    preds = predictions[:, :steps]
+    refs = references[:, :steps]
+    pred_step_delta = float(np.mean(np.abs(np.diff(preds, axis=1))))
+    ref_step_delta = float(np.mean(np.abs(np.diff(refs, axis=1))))
+    pred_first_last = float(np.mean(np.abs(preds[:, -1] - preds[:, 0])))
+    ref_first_last = float(np.mean(np.abs(refs[:, -1] - refs[:, 0])))
+    ratio = pred_step_delta / max(ref_step_delta, 1e-12)
+
+    return {
+        "pred_mean_step_delta": pred_step_delta,
+        "ref_mean_step_delta": ref_step_delta,
+        "pred_first_last_delta": pred_first_last,
+        "ref_first_last_delta": ref_first_last,
+        "pred_ref_step_delta_ratio": float(ratio),
+    }
+
+
+def _log_multi_obstacle_rollout_step_slider(
+    predictions: np.ndarray,
+    references: np.ndarray,
+    *,
+    wandb_prefix: str = "test",
+    max_steps: int | None = None,
+):
+    if predictions.ndim != 5 or references.ndim != 5:
+        raise ValueError(
+            f"Expected rollout tensors with shape (N,T,C,H,W), got predictions {predictions.shape}, references {references.shape}"
+        )
+
+    total_steps = min(int(predictions.shape[1]), int(references.shape[1]))
+    if total_steps <= 0:
+        return
+
+    if max_steps is not None:
+        total_steps = min(total_steps, int(max_steps))
+
+    sample_indices = list(range(min(4, predictions.shape[0])))
+    panel_preds = predictions[sample_indices, :total_steps]
+    panel_refs = references[sample_indices, :total_steps]
+    panel_min = float(min(np.min(panel_preds), np.min(panel_refs)))
+    panel_max = float(max(np.max(panel_preds), np.max(panel_refs)))
+
+    step_data_uris = []
+    step_indices = []
+    for step_idx in range(total_steps):
+        fig = _create_predictions_figure(
+            predictions[:, step_idx],
+            references[:, step_idx],
+            indices=sample_indices,
+            value_range=(panel_min, panel_max),
+        )
+        step_data_uris.append(_figure_to_data_uri(fig))
+        step_indices.append(step_idx)
+
+    html = _build_step_slider_html(
+        step_data_uris,
+        step_indices,
+        title=f"{wandb_prefix}/rollout_predictions",
+    )
+    wandb.log({f"{wandb_prefix}/rollout_predictions": wandb.Html(html)})
 
 def plot_hist_with_smooth_overlay_counts(
     edges: np.ndarray,
@@ -544,6 +892,10 @@ def setup(params, model_map=True):
         run = None
 
     ckpt_dir = "./"
+
+    if "_infer" in params.checkpoint_path and params.do_inference:
+        params.checkpoint_path = params.checkpoint_path.replace("_infer", "")
+
     if RANK == 0 or RANK == -1:
         if run.sweep_id is not None:
             ckpt_dir = (
@@ -577,6 +929,9 @@ def setup(params, model_map=True):
     if params.lr is not None:
         config["lr"] = float(params.lr)
 
+    if params.do_inference:
+        ckpt_dir = ckpt_dir.replace("_infer", "")
+
     return run, config, ckpt_dir, RANK, CPU_CORES
 
 
@@ -594,17 +949,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Set this if you have to replace the embeddings and recovery layers because you are not just using the density, velocity and pressure channels. Only relevant for finetuning.",
     )
-    parser.add_argument(
-        "--use_autoregressive",
-        action="store_true",
-        help="Use autoregressive rollout during training",
-    )
     params = read_cli(parser).parse_args()
     run, config, ckpt_dir, RANK, CPU_CORES = setup(params)
 
     print("Configuration:", config)
     # print(f"lr: {params.lr}")
 
+    ckpt = None
     try:
         ckpt = get_last_checkpoint(ckpt_dir)
         if ckpt is not None:
@@ -735,6 +1086,30 @@ if __name__ == "__main__":
         )
     else:
         model = ScOT(model_config)
+
+    if params.do_inference and params.finetune_from is None:
+        load_path = None
+        if trained_model_exists(ckpt_dir):
+            load_path = ckpt_dir
+        elif ckpt is not None:
+            load_path = ckpt
+
+        print(f"ckpt_dir: {ckpt_dir}")
+        print(f"load_path for inference: {load_path}")
+
+        if load_path is None:
+            raise FileNotFoundError(
+                "Inference requested but no saved checkpoint was found. "
+                "Please provide --finetune_from or ensure a checkpoint exists in the run directory."
+            )
+
+        if RANK == 0 or RANK == -1:
+            print(f"Loading model weights for inference from: {load_path}")
+        model = ScOT.from_pretrained(
+            load_path,
+            config=model_config,
+            ignore_mismatched_sizes=True,
+        )
     num_params = get_num_parameters(model)
     config["num_params"] = num_params
     num_params_no_embed = get_num_parameters_no_embed(model)
@@ -760,11 +1135,26 @@ if __name__ == "__main__":
                 "max_relative_l1_error": max_error,
             }
 
+        # Handle both 4D (num_samples, channels, H, W) and 5D (num_samples, T, channels, H, W) predictions
+        preds = eval_preds.predictions
+        labels = eval_preds.label_ids
+
+        if preds.ndim == 5 and labels.ndim == 5:
+            # Match full rollout targets: flatten time into batch
+            N, T, C, H, W = preds.shape
+            preds = preds.reshape(N * T, C, H, W)
+            labels = labels.reshape(N * T, C, H, W)
+        elif preds.ndim == 5 and labels.ndim == 4:
+            # Single-step targets: compare only first predicted step
+            preds = preds[:, 0]
+        elif preds.ndim == 4 and labels.ndim == 5 and labels.shape[1] == 1:
+            labels = labels[:, 0]
+
         error_statistics = [
             get_statistics(
                 relative_lp_error(
-                    eval_preds.predictions[:, channel_list[i] : channel_list[i + 1]],
-                    eval_preds.label_ids[:, channel_list[i] : channel_list[i + 1]],
+                    preds[:, channel_list[i] : channel_list[i + 1]],
+                    labels[:, channel_list[i] : channel_list[i + 1]],
                     p=1,
                     return_percent=True,
                 )
@@ -861,8 +1251,7 @@ if __name__ == "__main__":
             eval_dataset=None,
             compute_metrics=compute_metrics,
             time_budget=train_time_budget,
-            callbacks=[SaveEveryNEpochs(50)],
-            use_autoregressive=params.use_autoregressive
+            callbacks=[SaveEveryNEpochs(50)]
         )
 
         return trainer, train_config
@@ -1008,6 +1397,287 @@ if __name__ == "__main__":
 
         print("predictions shape:", preds.shape)
 
+        if (
+            params.do_inference
+            or (
+            "MultiObstacleIncompressibleMultiFrame" in config["dataset"]
+            or "MultiObstacleIncompressibleMultiframe" in config["dataset"]
+            )
+        ):
+            requested_total_frames = 200
+            print(
+                f"\nRunning multi-obstacle long-rollout evaluation for {requested_total_frames} total frames..."
+            )
+            rollout_history = 5
+            long_rollout_set_kwargs = {
+                "frames": rollout_history + 1,
+                "history": rollout_history,
+                "T_len": 1,
+                "resolution": config["image_size"],
+            }
+            if params.move_data is not None:
+                long_rollout_set_kwargs["move_to_local_scratch"] = params.move_data
+
+            long_rollout_dataset = get_dataset(
+                dataset=config["dataset"],
+                which="test",
+                num_trajectories=config["eval_ndata"],
+                max_traj_per_file=config["max_traj_per_file"],
+                file_count=config["file_count"],
+                file_prefix=config["file_prefix"],
+                N_val=config["eval_ndata"],
+                data_path=params.data_path,
+                **long_rollout_set_kwargs,
+            )
+
+            long_rollout_dataset._load_file(0)
+
+            frame_axis = 1 if getattr(long_rollout_dataset, "_layout", "NTHW") == "NTHW" else 3
+            available_rollout_steps = int(long_rollout_dataset._vx.shape[frame_axis]) - rollout_history
+            long_rollout_steps = min(requested_total_frames - rollout_history, available_rollout_steps)
+            if available_rollout_steps < requested_total_frames - rollout_history:
+                print(
+                    f"WARNING: only {available_rollout_steps} rollout steps are available from the stored trajectory; "
+                    f"requested {requested_total_frames - rollout_history}."
+                )
+            print(
+                f"Using history={rollout_history} and {long_rollout_steps} autoregressive steps "
+                f"to evaluate {rollout_history + long_rollout_steps} total frames."
+            )
+
+            old_inference_time = trainer.inference_time
+            old_eval_bs = trainer.args.per_device_eval_batch_size
+            old_compute_metrics = trainer.compute_metrics
+            old_ar_steps = trainer.ar_steps
+            old_output_all_steps = trainer.output_all_steps
+            trainer.inference_time = 0.0
+            trainer.args.per_device_eval_batch_size = 1
+            trainer.compute_metrics = None
+            trainer.set_ar_steps([1] * long_rollout_steps, output_all_steps=True)
+            torch.cuda.empty_cache()
+            long_rollout_ts = time.time()
+            long_rollout_predictions = trainer.predict(long_rollout_dataset, metric_key_prefix="")
+            long_rollout_te = time.time()
+
+            rollout_preds_norm = np.asarray(long_rollout_predictions.predictions)
+            if rollout_preds_norm.ndim != 5:
+                raise ValueError(
+                    f"Long-rollout predictions must be 5D (N,T,C,H,W) when output_all_steps=True, got {rollout_preds_norm.shape}"
+                )
+            print(f"Long-rollout prediction tensor shape: {rollout_preds_norm.shape}")
+            rollout_preds = _denormalize_multi_obstacle_rollout(
+                rollout_preds_norm,
+                long_rollout_dataset.constants["mean"].cpu().numpy(),
+                long_rollout_dataset.constants["std"].cpu().numpy(),
+            )
+            rollout_refs = _extract_multi_obstacle_reference_rollout(
+                long_rollout_dataset,
+                long_rollout_steps,
+            )
+            rollout_physical_scores = (
+                _channelwise_physical_nrmse_multi_obstacle(
+                    rollout_preds,
+                    rollout_refs,
+                    _multi_obstacle_fluid_masks(
+                        long_rollout_dataset,
+                        rollout_preds.shape[0],
+                    ),
+                )
+            )
+            rollout_physical_nrmse = rollout_physical_scores.mean(axis=0)
+            rollout_physical_nrmse_macro = float(
+                rollout_physical_nrmse.mean()
+            )
+            print(
+                "Channelwise physical-unit nRMSE | "
+                f"vx={rollout_physical_nrmse[0]:.6f}, "
+                f"vy={rollout_physical_nrmse[1]:.6f}, "
+                "pressure(gauge-centered)="
+                f"{rollout_physical_nrmse[2]:.6f}, "
+                f"macro={rollout_physical_nrmse_macro:.6f}"
+            )
+            mean = long_rollout_dataset.constants["mean"].cpu().numpy().reshape(1, 1, -1, 1, 1)
+            std = long_rollout_dataset.constants["std"].cpu().numpy().reshape(1, 1, -1, 1, 1)
+            rollout_refs_norm = (rollout_refs - mean) / std
+            rollout_diagnostics_norm = _compute_rollout_temporal_diagnostics(
+                rollout_preds_norm,
+                rollout_refs_norm,
+            )
+
+            rollout_stats = _compute_multi_obstacle_time_avg_stats(
+                rollout_preds,
+                rollout_refs,
+                last_n=160,
+            )
+            rollout_diagnostics = _compute_rollout_temporal_diagnostics(
+                rollout_preds,
+                rollout_refs,
+            )
+
+            if RANK == 0 or RANK == -1:
+                _log_multi_obstacle_rollout_step_slider(
+                    rollout_preds_norm,
+                    rollout_refs_norm,
+                    wandb_prefix="test/long_rollout",
+                    max_steps=requested_total_frames - rollout_history,
+                )
+
+                short_rollout_steps = min(14, rollout_preds.shape[1], rollout_refs.shape[1])
+                if short_rollout_steps > 0:
+                    _log_multi_obstacle_rollout_step_slider(
+                        rollout_preds_norm,
+                        rollout_refs_norm,
+                        wandb_prefix="test/short_rollout",
+                        max_steps=short_rollout_steps,
+                    )
+
+            print("Multi-obstacle 200-step rollout time-average statistics:")
+            for quantity in ["velocity_x", "velocity_y", "pressure"]:
+                print(
+                    f"  {quantity:>10s} | flip: {rollout_stats[f'tavg_flip_{quantity}']:.6f} | "
+                    f"noflip: {rollout_stats[f'tavg_noflip_{quantity}']:.6f} | "
+                    f"worst_noflip: {rollout_stats[f'worst_tavg_noflip_{quantity}']:.6f} "
+                    f"(idx={rollout_stats[f'worst_tavg_noflip_{quantity}_traj_idx']})"
+                )
+            print(
+                f"  {'velocity':>10s} | flip: {rollout_stats['tavg_flip_velocity']:.6f} | "
+                f"noflip: {rollout_stats['tavg_noflip_velocity']:.6f} | "
+                f"worst_noflip: {rollout_stats['worst_tavg_noflip_velocity']:.6f} "
+                f"(idx={rollout_stats['worst_tavg_noflip_velocity_traj_idx']})"
+            )
+            print(
+                f"  {'all_fields':>10s} | flip: {rollout_stats['tavg_flip_all_fields']:.6f} | "
+                f"noflip: {rollout_stats['tavg_noflip_all_fields']:.6f} | "
+                f"worst_noflip: {rollout_stats['worst_tavg_noflip_all_fields']:.6f} "
+                f"(idx={rollout_stats['worst_tavg_noflip_all_fields_traj_idx']})"
+            )
+            print(
+                f"Multi-obstacle 200-step rollout inference time (total): {long_rollout_te - long_rollout_ts}"
+            )
+            print(
+                f"Multi-obstacle 200-step rollout inference time per trajectory: "
+                f"{(long_rollout_te - long_rollout_ts) / long_rollout_dataset._num_traj_total}"
+            )
+            print(
+                "Rollout temporal diagnostics | "
+                f"pred_step_delta={rollout_diagnostics['pred_mean_step_delta']:.6e}, "
+                f"ref_step_delta={rollout_diagnostics['ref_mean_step_delta']:.6e}, "
+                f"pred/ref ratio={rollout_diagnostics['pred_ref_step_delta_ratio']:.6f}"
+            )
+            print(
+                "Rollout temporal diagnostics (normalized) | "
+                f"pred_step_delta={rollout_diagnostics_norm['pred_mean_step_delta']:.6e}, "
+                f"ref_step_delta={rollout_diagnostics_norm['ref_mean_step_delta']:.6e}, "
+                f"pred/ref ratio={rollout_diagnostics_norm['pred_ref_step_delta_ratio']:.6f}"
+            )
+
+            if RANK == 0 or RANK == -1:
+                rollout_metrics = {
+                    "test/long_rollout_infer_time": long_rollout_te - long_rollout_ts,
+                    "test/long_rollout_infer_time_per_traj": (
+                        (long_rollout_te - long_rollout_ts) / long_rollout_dataset._num_traj_total
+                    ),
+                }
+                for quantity in ["velocity_x", "velocity_y", "pressure"]:
+                    rollout_metrics[f"test/{quantity}/tavg_flip_nrmse"] = rollout_stats[
+                        f"tavg_flip_{quantity}"
+                    ]
+                    rollout_metrics[f"test/{quantity}/tavg_noflip_nrmse"] = rollout_stats[
+                        f"tavg_noflip_{quantity}"
+                    ]
+                    rollout_metrics[f"test/{quantity}/worst_tavg_flip_nrmse"] = rollout_stats[
+                        f"worst_tavg_flip_{quantity}"
+                    ]
+                    rollout_metrics[f"test/{quantity}/worst_tavg_noflip_nrmse"] = rollout_stats[
+                        f"worst_tavg_noflip_{quantity}"
+                    ]
+                    rollout_metrics[f"test/{quantity}/worst_tavg_flip_traj_idx"] = rollout_stats[
+                        f"worst_tavg_flip_{quantity}_traj_idx"
+                    ]
+                    rollout_metrics[f"test/{quantity}/worst_tavg_noflip_traj_idx"] = rollout_stats[
+                        f"worst_tavg_noflip_{quantity}_traj_idx"
+                    ]
+                rollout_metrics["test/velocity/tavg_flip_nrmse"] = rollout_stats[
+                    "tavg_flip_velocity"
+                ]
+                rollout_metrics["test/velocity/tavg_noflip_nrmse"] = rollout_stats[
+                    "tavg_noflip_velocity"
+                ]
+                rollout_metrics["test/velocity/worst_tavg_flip_nrmse"] = rollout_stats[
+                    "worst_tavg_flip_velocity"
+                ]
+                rollout_metrics["test/velocity/worst_tavg_noflip_nrmse"] = rollout_stats[
+                    "worst_tavg_noflip_velocity"
+                ]
+                rollout_metrics["test/velocity/worst_tavg_flip_traj_idx"] = rollout_stats[
+                    "worst_tavg_flip_velocity_traj_idx"
+                ]
+                rollout_metrics["test/velocity/worst_tavg_noflip_traj_idx"] = rollout_stats[
+                    "worst_tavg_noflip_velocity_traj_idx"
+                ]
+                rollout_metrics["test/all_fields/tavg_flip_nrmse"] = rollout_stats[
+                    "tavg_flip_all_fields"
+                ]
+                rollout_metrics["test/all_fields/tavg_noflip_nrmse"] = rollout_stats[
+                    "tavg_noflip_all_fields"
+                ]
+                rollout_metrics["test/all_fields/worst_tavg_flip_nrmse"] = rollout_stats[
+                    "worst_tavg_flip_all_fields"
+                ]
+                rollout_metrics["test/all_fields/worst_tavg_noflip_nrmse"] = rollout_stats[
+                    "worst_tavg_noflip_all_fields"
+                ]
+                rollout_metrics["test/all_fields/worst_tavg_flip_traj_idx"] = rollout_stats[
+                    "worst_tavg_flip_all_fields_traj_idx"
+                ]
+                rollout_metrics["test/all_fields/worst_tavg_noflip_traj_idx"] = rollout_stats[
+                    "worst_tavg_noflip_all_fields_traj_idx"
+                ]
+                rollout_metrics["test/long_rollout/pred_mean_step_delta"] = rollout_diagnostics[
+                    "pred_mean_step_delta"
+                ]
+                rollout_metrics["test/long_rollout/ref_mean_step_delta"] = rollout_diagnostics[
+                    "ref_mean_step_delta"
+                ]
+                rollout_metrics["test/long_rollout/pred_first_last_delta"] = rollout_diagnostics[
+                    "pred_first_last_delta"
+                ]
+                rollout_metrics["test/long_rollout/ref_first_last_delta"] = rollout_diagnostics[
+                    "ref_first_last_delta"
+                ]
+                rollout_metrics["test/long_rollout/pred_ref_step_delta_ratio"] = rollout_diagnostics[
+                    "pred_ref_step_delta_ratio"
+                ]
+                rollout_metrics["test/long_rollout_norm/pred_mean_step_delta"] = rollout_diagnostics_norm[
+                    "pred_mean_step_delta"
+                ]
+                rollout_metrics["test/long_rollout_norm/ref_mean_step_delta"] = rollout_diagnostics_norm[
+                    "ref_mean_step_delta"
+                ]
+                rollout_metrics["test/long_rollout_norm/pred_ref_step_delta_ratio"] = rollout_diagnostics_norm[
+                    "pred_ref_step_delta_ratio"
+                ]
+                rollout_metrics[
+                    "test/channelwise_physical_nrmse/velocity_x"
+                ] = float(rollout_physical_nrmse[0])
+                rollout_metrics[
+                    "test/channelwise_physical_nrmse/velocity_y"
+                ] = float(rollout_physical_nrmse[1])
+                rollout_metrics[
+                    "test/channelwise_physical_nrmse/pressure_gauge_centered"
+                ] = float(rollout_physical_nrmse[2])
+                rollout_metrics[
+                    "test/channelwise_physical_nrmse_macro"
+                ] = rollout_physical_nrmse_macro
+                rollout_metrics["test/nrmse"] = rollout_physical_nrmse_macro
+                wandb.log(rollout_metrics)
+
+            trainer.inference_time = old_inference_time
+            trainer.args.per_device_eval_batch_size = old_eval_bs
+            trainer.compute_metrics = old_compute_metrics
+            trainer.ar_steps = old_ar_steps
+            trainer.output_all_steps = old_output_all_steps
+
         if RANK == 0 or RANK == -1:
             metrics = {}
             for key, value in predictions.metrics.items():
@@ -1072,7 +1742,7 @@ if __name__ == "__main__":
                         wandb_prefix="test_out_dist/ar",
                     )
 
-    tee = time.time()
+    # tee = time.time()
 
-    # print("train time:", te-ts)
-    print("test time:", tee-te)
+    # # print("train time:", te-ts)
+    # print("test time:", tee-te)
