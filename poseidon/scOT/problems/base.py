@@ -45,7 +45,13 @@ def get_dataset(dataset, **kwargs):
     if isinstance(dataset, list):
         return ConcatDataset([get_dataset(d, **kwargs) for d in dataset])
     if "fluids" in dataset:
-        if "fluids.MultiObstacleIncompressibleMultiframe" in dataset:
+        if (
+            "fluids.MultiObstacleIncompressibleMultiframe" in dataset
+            or (
+                "fluids.MultiObstacleIncompressibleMultiFrame" in dataset
+                and kwargs.get("single_frame_initialization", False)
+            )
+        ):
             from .fluids.multi_obstacle import MultiObstacleIncompressibleMultiframe as dset
             default_time_settings = {"max_num_time_steps": 21, "time_step_size": 1}
             kwargs = {**default_time_settings, **kwargs}
@@ -329,6 +335,8 @@ class BaseTimeDataset(BaseDataset, ABC):
         max_traj_per_file: Optional[int] = None,
         file_count: Optional[int] = None,
         file_prefix: Optional[str] = None,
+        single_frame_initialization: bool = False,
+        initialization_only: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -342,11 +350,23 @@ class BaseTimeDataset(BaseDataset, ABC):
         assert time_step_size is not None and time_step_size > 0
         assert fix_input_to_time_step is None or fix_input_to_time_step >= 0
 
-        super().__init__(*args, **kwargs)
+        base_dataset_keys = {
+            "which",
+            "num_trajectories",
+            "data_path",
+            "move_to_local_scratch",
+            "N_val",
+        }
+        super().__init__(
+            *args,
+            **{key: value for key, value in kwargs.items() if key in base_dataset_keys},
+        )
         self.max_num_time_steps = max_num_time_steps
         self.time_step_size = time_step_size
         self.fix_input_to_time_step = fix_input_to_time_step
         self.allowed_time_transitions = allowed_time_transitions
+        self.single_frame_initialization = bool(single_frame_initialization)
+        self.initialization_only = bool(initialization_only)
 
     def _idx_map(self, idx):
         i = idx // self.multiplier

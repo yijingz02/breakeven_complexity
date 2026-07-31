@@ -243,12 +243,20 @@ class MultiObstacleVorticityMultiFrame(BaseTimeDataset):
         self.T_len = int(kwargs.get("T_len", 1))
 
         assert self.history >= 1
-        assert self.frames >= self.history + self.T_len, (
+        assert self.single_frame_initialization or self.frames >= self.history + self.T_len, (
             f"Need frames >= history + T_len. Got frames={self.frames}, history={self.history}, T_len={self.T_len}"
         )
 
         # t0 so input uses [t0..t0+history-1], target at t0+history-1+T_len
-        self.samples_per_traj = self.frames - (self.history + self.T_len) + 1
+        self.samples_per_traj = (
+            1
+            if self.initialization_only
+            else (
+                self.frames - self.T_len
+                if self.single_frame_initialization
+                else self.frames - (self.history + self.T_len) + 1
+            )
+        )
 
         self.input_dim = self.history + (1 if self.use_mask else 0)
         self.output_dim = 1
@@ -344,9 +352,14 @@ class MultiObstacleVorticityMultiFrame(BaseTimeDataset):
         traj_u = self._u[int(local_idx)]  # (T,H,W)
 
         # history window: (history,H,W)
-        u_hist = traj_u[int(t0): int(t0 + self.history)]
-        # target at last history + T_len
-        t_target = int(t0 + self.history - 1 + self.T_len)
+        if self.single_frame_initialization:
+            indices = [max(0, t0 - self.history + 1 + i) for i in range(self.history)]
+            u_hist = traj_u[indices]
+            t_target = int(t0 + self.T_len)
+        else:
+            u_hist = traj_u[int(t0): int(t0 + self.history)]
+            # target at last history + T_len
+            t_target = int(t0 + self.history - 1 + self.T_len)
         u_tgt = traj_u[t_target]          # (H,W)
 
         inputs = u_hist                   # (history,H,W)
@@ -657,13 +670,21 @@ class MultiObstacleIncompressibleMultiframe(BaseTimeDataset):
         # number of conditioning frames (you want 5)
         self.history      = int(kwargs.get("history", 5))
         assert self.history >= 1, "history must be >= 1"
-        assert self.frames >= self.history + self.T_len, (
+        assert self.single_frame_initialization or self.frames >= self.history + self.T_len, (
             f"Need frames >= history + T_len. Got frames={self.frames}, history={self.history}, T_len={self.T_len}"
         )
 
         # number of training samples per trajectory
         # choose t0 so that input uses [t0, ..., t0+history-1] and target is at t0+history-1+T_len
-        self.samples_per_traj = self.frames - (self.history + self.T_len) + 1
+        self.samples_per_traj = (
+            1
+            if self.initialization_only
+            else (
+                self.frames - self.T_len
+                if self.single_frame_initialization
+                else self.frames - (self.history + self.T_len) + 1
+            )
+        )
 
         # mask semantics
         # if True: raw mask True = obstacle; if False: raw mask True = fluid
@@ -825,10 +846,14 @@ class MultiObstacleIncompressibleMultiframe(BaseTimeDataset):
         file_idx, local_idx = self._traj_to_file_local(int(traj_id))
         self._load_file(file_idx)
 
-        # Build history window: times [t0, ..., t0+history-1]
+        # Build history window.
         x_list = []
         for k in range(self.history):
-            t = t0 + k
+            t = (
+                max(0, t0 - self.history + 1 + k)
+                if self.single_frame_initialization
+                else t0 + k
+            )
             vx = self._get_frame(self._vx, local_idx, t)
             vy = self._get_frame(self._vy, local_idx, t)
             p  = self._get_frame(self._p,  local_idx, t)
@@ -836,7 +861,7 @@ class MultiObstacleIncompressibleMultiframe(BaseTimeDataset):
 
         x_phys = torch.cat(x_list, dim=0)
 
-        t_last   = t0 + self.history - 1
+        t_last = t0 if self.single_frame_initialization else t0 + self.history - 1
         t_target = t_last + self.T_len
 
         vx_out = self._get_frame(self._vx, local_idx, t_target)

@@ -139,6 +139,21 @@ def _get_batch_B(batch_data, fallback: int):
     return int(fallback)
 
 
+def initialize_single_frame_history(flow: Flow, ic: Grid, enabled: bool) -> Grid:
+  """Repeat the first temporal channel block for flows with bundled history."""
+  history_length = int(getattr(flow, "n_steps_input", 1))
+  if not enabled or history_length <= 1:
+    return ic
+  channels = ic.value.shape[-1]
+  if channels % history_length:
+    raise ValueError(
+      f"Cannot split {channels} input channels into {history_length} history frames"
+    )
+  channels_per_frame = channels // history_length
+  first = ic.value[..., :channels_per_frame]
+  return Grid(jnp.concatenate([first] * history_length, axis=-1), ic.size)
+
+
 def cap_train_loader(dataloader, trainer, cfg):
   """
   Supports either:
@@ -201,7 +216,15 @@ def l2_rel(pred, targ, eps: float = 1e-12):
   den = jnp.linalg.norm(tf) + eps
   return num / den
 
-def per_traj_l2_rel_distribution(forward, variable, flow, *, eps: float = 1e-12, max_traj: int | None = None):
+def per_traj_l2_rel_distribution(
+  forward,
+  variable,
+  flow,
+  *,
+  single_frame_initialization: bool = False,
+  eps: float = 1e-12,
+  max_traj: int | None = None,
+):
   """
   Returns:
     losses: np.ndarray shape (num_traj,), per-trajectory relative L2 over the whole rollout
@@ -215,7 +238,9 @@ def per_traj_l2_rel_distribution(forward, variable, flow, *, eps: float = 1e-12,
     if max_traj is not None and j >= int(max_traj):
       break
 
-    u = data[0].ic
+    u = initialize_single_frame_history(
+      flow, data[0].ic, single_frame_initialization
+    )
     err2 = 0.0
     tar2 = 0.0
 
@@ -328,6 +353,9 @@ class Trainer:
   window: Maybe[int]
   gradient_clip: Maybe[float]
 
+  inference_batch_size: int = 16
+  use_autoregressive: bool = False
+  single_frame_initialization: bool = False
   optimizer_name: str = "adamw"
   optimizer_kwargs: dict = field(default_factory=dict)
 
@@ -378,8 +406,11 @@ class Trainer:
     prng, subkey = jrand.split(prng)
     u, *_ = next(iter(flow.dataset("test")))
 
-    print(model.tabulate(subkey, flow, u.ic, None))
-    variable = model.init(subkey, flow, u.ic, None)
+    ic = initialize_single_frame_history(
+      flow, u.ic, self.single_frame_initialization
+    )
+    print(model.tabulate(subkey, flow, ic, None))
+    variable = model.init(subkey, flow, ic, None)
 
     optim = self.optimizer.init(variable["params"])
     return self.State(prng, variable, optim)
@@ -451,8 +482,11 @@ class Trainer:
 
       def batch_grad(params: PyTree, batch_data: Flow.Data):
         grad_t = jax.grad(F.partial(self.loss, flow, model), has_aux=True)
+        batch_ic = initialize_single_frame_history(
+          flow, batch_data[0].ic, self.single_frame_initialization
+        )
         grad, (_, metric) = utils.vmap(F.partial(grad_t, params), self.vmap_batch)(
-          batch_data[0].ic, batch_data[0].ut
+          batch_ic, batch_data[0].ut
         )
         grad, metric = jax.tree.map(F.partial(jnp.mean, axis=0), (grad, metric))
         if self.batch_sharding:
@@ -481,7 +515,10 @@ class Trainer:
           return ScanState(out.u, carry.loss + jnp.mean(loss)), jax.tree.map(jnp.mean, metric)
 
         xs = jax.tree.map(lambda *xs: jnp.stack(xs), *batch_data)
-        scan, metric = lax.scan(next, ScanState(batch_data[0].ic, 0.), xs)
+        initial_ic = initialize_single_frame_history(
+          flow, batch_data[0].ic, self.single_frame_initialization
+        )
+        scan, metric = lax.scan(next, ScanState(initial_ic, 0.), xs)
 
         loss = scan.loss / len(batch_data)
         result = (loss, metric)
@@ -518,6 +555,11 @@ class Trainer:
       # _datacnt = train_cfg.pop("datacnt", None)
 
       trainer = cls(**train_cfg)
+      setattr(
+        flow,
+        "single_frame_initialization",
+        trainer.single_frame_initialization,
+      )
       trainer.discard_budget_steps = _discard_budget_steps_cfg
 
       time_budget_s_for_name = _time_budget_s_cfg
@@ -696,7 +738,12 @@ class Trainer:
       # Phase B: rebuild step/forward so JIT captures updated optimizer/sched
       # ------------------------------------------------------------------ #
       step, forward = make_step_and_forward()
-      eval_fn = cls.make_eval(forward, flow)
+      eval_fn = cls.make_eval(
+        forward,
+        flow,
+        trainer.inference_batch_size,
+        trainer.single_frame_initialization,
+      )
 
       # ----------------------------------- RUN ----------------------------------- #
 
@@ -856,14 +903,22 @@ class Trainer:
       logging.info(f"Final eval @ it={int(it)}: {final_eval}")
 
       if wb:
-        wandb.log(_flatten_for_wandb(final_eval, prefix="eval"), step=int(it))
+        final_wandb_metrics = _flatten_for_wandb(final_eval, prefix="eval")
+        final_wandb_metrics["test/dnrmse"] = float(final_eval["dnrmse"])
+        wandb.log(final_wandb_metrics, step=int(it))
 
       # ---- Per-trajectory L2 distribution + worst-case logging ----
       if wb:
         # optionally cap how many test traj to evaluate (None = all)
         max_eval_traj = getattr(cfg.log, "eval_max_traj", None)
 
-        losses = per_traj_l2_rel_distribution(forward, state.variable, flow, max_traj=max_eval_traj)
+        losses = per_traj_l2_rel_distribution(
+          forward,
+          state.variable,
+          flow,
+          single_frame_initialization=trainer.single_frame_initialization,
+          max_traj=max_eval_traj,
+        )
         if losses.size > 0:
           worst_idx = int(np.argmax(losses))
           worst_val = float(losses[worst_idx])
@@ -945,10 +1000,20 @@ class Trainer:
   # ---------------------------------------------------------------------------- #
 
   @classmethod
-  def make_eval(cls, f: Forward, flow: Flow) -> EvalFn:
+  def make_eval(
+    cls,
+    f: Forward,
+    flow: Flow,
+    batch_size: int = 1,
+    single_frame_initialization: bool = False,
+  ) -> EvalFn:
     def roll(variable: PyTree, data: Flow.Data) -> PyTree:
-      u = data[0].ic
+      u = initialize_single_frame_history(
+        flow, data[0].ic, single_frame_initialization
+      )
       metric = dd(lambda: [])
+      dnrmse_numerator = None
+      dnrmse_denominator = None
 
       print(len(data), "timesteps in eval rollout???")
 
@@ -961,6 +1026,19 @@ class Trainer:
         u = out.u if isinstance(out.u, Grid) else out.u.eval(data[i].ut.resolution)
         ut = data[i].ut
 
+        channels = min(u.value.shape[-1], ut.value.shape[-1])
+        pred_value = u.value[..., :channels]
+        ref_value = ut.value[..., :channels]
+        reduction_dims = tuple(range(1, ref_value.ndim - 1))
+        channel_diff2 = jnp.square(pred_value - ref_value).sum(axis=reduction_dims)
+        channel_ref2 = jnp.square(ref_value).sum(axis=reduction_dims)
+        if dnrmse_numerator is None:
+          dnrmse_numerator = channel_diff2
+          dnrmse_denominator = channel_ref2
+        else:
+          dnrmse_numerator += channel_diff2
+          dnrmse_denominator += channel_ref2
+
         metric_t = flow.metric(u, ut)
         # --- NEW: L2 metrics ---
         metric_t["l2_rmse"] = l2_rmse(u, ut)
@@ -969,16 +1047,25 @@ class Trainer:
         for key, value in metric_t.items():
           metric[key].append(jax.tree.map(float, value))
 
-      return dict(metric)
+      result = dict(metric)
+      result["dnrmse_samples"] = jnp.sqrt(
+        dnrmse_numerator / jnp.maximum(dnrmse_denominator, 1e-12)
+      ).mean(axis=-1)
+      return result
 
     def eval(variable: PyTree) -> PyTree:
       dataset = flow.dataset("test")
+      dataset = utils.batched(dataset, batch_size, drop_last=False)
       if config.tqdm:
         dataset = tqdm(dataset, "Test")
 
       metrics = dd(lambda: [])
+      dnrmse_samples = []
       for data in dataset:
         rolled = roll(variable, data)
+        dnrmse_samples.extend(
+          np.asarray(jax.device_get(rolled.pop("dnrmse_samples"))).reshape(-1)
+        )
         for key, values in rolled.items():
           for t, value in enumerate(values):
             metrics[f"{key}_avg"].append(value)
@@ -986,6 +1073,7 @@ class Trainer:
 
       mean = lambda *x: np.mean(x).item()
       metrics_out = { key: jax.tree.map(mean, *value) for key, value in metrics.items() }
+      metrics_out["dnrmse"] = float(np.mean(dnrmse_samples))
       return metrics_out
 
     return eval

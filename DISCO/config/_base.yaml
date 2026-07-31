@@ -25,6 +25,7 @@ learning_rate: -1 # -1 means use DAdapt  # otherwise 0.005
 weight_decay: 1e-3 
 n_past: 16 # N steps in the context (input)
 n_future: 1 # N future steps to predict (output)
+single_frame_initialization: !!bool False # Repeat the first frame to fill missing initial history
 unroll_steps_train: 1 # Autoregressive unrolling steps during training (>1 enables temporal curriculum)
 use_curriculum: !!bool True # Whether to auto-increase unroll length: epochs 0-2 use 2, 3-5 use 4, 6+ use 8
 pushforward_noise_std: 0.0 # Noise std for Pushforward Trick; injects noise in predictions to teach recovery

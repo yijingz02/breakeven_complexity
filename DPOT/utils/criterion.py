@@ -20,6 +20,17 @@ def get_loss_func(name, component, normalizer):
     else:
         raise NotImplementedError
 
+
+def dimensionwise_nrmse(pred, target, eps=1e-12):
+    """Per-sample mean of per-channel relative L2 over all other dimensions."""
+    batch_size, channels = target.shape[0], target.shape[-1]
+    diff = (pred - target).float().reshape(batch_size, -1, channels)
+    ref = target.float().reshape(batch_size, -1, channels)
+    numerator = diff.square().sum(dim=1)
+    denominator = ref.square().sum(dim=1).clamp_min(eps)
+    return torch.sqrt(numerator / denominator).mean(dim=1)
+
+
 class SimpleLpLoss(_WeightedLoss):
     def __init__(self, d=2, p=2, size_average=True, reduction=True,return_comps = False):
         super(SimpleLpLoss, self).__init__()

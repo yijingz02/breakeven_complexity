@@ -175,6 +175,7 @@ class KuramotoSivashinskyMultiFileMultiFrame(BaseTimeDataset):
         self.max_traj_per_file = kwargs.get("max_traj_per_file")
         self.num_trajectories = kwargs.get("num_trajectories")
 
+        self.history = 5
         self.input_dim  = 5 # u * 5 frames
         self.output_dim = 1
 
@@ -196,7 +197,11 @@ class KuramotoSivashinskyMultiFileMultiFrame(BaseTimeDataset):
         self.frames = 50
         self.T_len  = 5
 
-        self.samples_per_traj = self.frames - self.T_len
+        self.samples_per_traj = (
+            self.frames - 1
+            if self.single_frame_initialization
+            else self.frames - self.T_len
+        )
 
         self._traj_per_file = self.max_traj_per_file
 
@@ -280,7 +285,7 @@ class KuramotoSivashinskyMultiFileMultiFrame(BaseTimeDataset):
     def __getitem__(self, idx):
         traj_id = idx // self.samples_per_traj
         t1      = idx %  self.samples_per_traj
-        t2      = t1 + self.T_len
+        t2      = t1 + (1 if self.single_frame_initialization else self.T_len)
 
         file_idx  = (traj_id % self.num_trajectories) // self.max_traj_per_file
         local_idx = (traj_id % self.num_trajectories) %  self.max_traj_per_file
@@ -289,7 +294,11 @@ class KuramotoSivashinskyMultiFileMultiFrame(BaseTimeDataset):
 
         traj_u = self._u[local_idx]
 
-        u_in = traj_u[:, :, t1:t2]
+        if self.single_frame_initialization:
+            indices = [max(0, t1 - self.history + 1 + i) for i in range(self.history)]
+            u_in = traj_u[:, :, indices]
+        else:
+            u_in = traj_u[:, :, t1:t2]
         u_out = traj_u[:, :, t2]
         
         inputs = u_in.unsqueeze(0)

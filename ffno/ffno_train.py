@@ -216,6 +216,9 @@ T_in = int(_cfg_get('T_in', 10))
 T_total = int(_cfg_get('T_total', 200))
 T = T_total - T_in
 batch_size = int(_cfg_get('batch_size', 100))
+inference_batch_size = int(_cfg_get('inference_batch_size', 100))
+single_frame_initialization = bool(_cfg_get('single_frame_initialization', False))
+T_rollout = T + (T_in - 1 if single_frame_initialization else 0)
 learning_rate = float(_cfg_get('learning_rate', 0.001))
 
 # compute budget
@@ -233,7 +236,7 @@ scheduler_gamma = float(_cfg_get('scheduler_gamma', 0.5))
 print(f"train budget: {train_budget:.2f}")
 print(learning_rate, scheduler_step, scheduler_gamma)
 
-def load_data_np(data_path, file_index, n, sub, S, T_in, T):
+def load_data_np(data_path, file_index, n, sub, S, T_in, rollout_steps):
     u_p = os.path.join(data_path, f"data_{file_index}_u.npy")
     v_p = os.path.join(data_path, f"data_{file_index}_v.npy")
     
@@ -244,18 +247,24 @@ def load_data_np(data_path, file_index, n, sub, S, T_in, T):
         fu = torch.from_numpy(u).float()
         fv = torch.from_numpy(v).float()
 
-        train_x_u = fu[:n, ::sub, ::sub, 0:1].repeat(1, 1, 1, T_in)
-        train_x_v = fv[:n, ::sub, ::sub, 0:1].repeat(1, 1, 1, T_in)
+        if single_frame_initialization:
+            train_x_u = fu[:n, ::sub, ::sub, 0:1].repeat(1, 1, 1, T_in)
+            train_x_v = fv[:n, ::sub, ::sub, 0:1].repeat(1, 1, 1, T_in)
+            target_start = 1
+        else:
+            train_x_u = fu[:n, ::sub, ::sub, :T_in]
+            train_x_v = fv[:n, ::sub, ::sub, :T_in]
+            target_start = T_in
         train_x = torch.stack([train_x_u, train_x_v], dim=-1)
 
-        train_y_u = fu[:n, ::sub, ::sub, 1:T+1]
-        train_y_v = fv[:n, ::sub, ::sub, 1:T+1]
+        train_y_u = fu[:n, ::sub, ::sub, target_start:target_start + rollout_steps]
+        train_y_v = fv[:n, ::sub, ::sub, target_start:target_start + rollout_steps]
         train_y = torch.stack([train_y_u, train_y_v], dim=-1)
 
         train_x = train_x.reshape(n, S//sub, S//sub, T_in, 2)
-        train_y = train_y.reshape(n, S//sub, S//sub, T, 2)
+        train_y = train_y.reshape(n, S//sub, S//sub, rollout_steps, 2)
 
-        current_batch_size = 100 if file_index == "val" else batch_size
+        current_batch_size = inference_batch_size if file_index == "val" else batch_size
         current_shuffle = False if file_index == "val" else True
 
         loader = torch.utils.data.DataLoader(
@@ -300,8 +309,8 @@ loss_fn = LpLoss()
 
 # simple data file handling: load first chunk and a val chunk
 data_path = _cfg_get('data_path', '.')
-train_loader = load_data_np(data_path, 0, min(2000, ntrain), sub, S, T_in, T)
-val_loader = load_data_np(data_path, 'val', 100, sub, S, T_in, T)
+train_loader = load_data_np(data_path, 0, min(2000, ntrain), sub, S, T_in, T_rollout)
+val_loader = load_data_np(data_path, 'val', 100, sub, S, T_in, T_rollout)
 
 # Training loop (kept concise; follows original style)
 model.train()
@@ -311,7 +320,7 @@ best_full_loss = float('inf')
 
 # warmup
 for xx, yy in train_loader:
-    for t in range(0, T):
+    for t in range(T_rollout):
         optimizer.zero_grad(set_to_none=True)
         if t == 0:
             inp = xx[..., :T_in, :]
@@ -348,13 +357,13 @@ while cur_total_time < train_budget:
         if trained_data >= ntrain or cur_total_time >= train_budget:
             break
         try:
-            train_loader = load_data_np(data_path, file_index, min(2000, ntrain - trained_data), sub, S, T_in, T)
+            train_loader = load_data_np(data_path, file_index, min(2000, ntrain - trained_data), sub, S, T_in, T_rollout)
         except FileNotFoundError:
             break
 
         for xx, yy in train_loader:
             trained_data += batch_size
-            for t in range(0, T):
+            for t in range(T_rollout):
                 if t == 0:
                     inp = xx[..., :T_in, :]
                 elif t < T_in:
@@ -391,7 +400,7 @@ while cur_total_time < train_budget:
             if cur_total_time >= train_budget or trained_data >= ntrain:
                 break
 
-    print(f"Epoch {ep} time {cur_total_time:.2f} loss {(train_step_loss / max(1, trained_data) / max(1, T)):.6f}")
+    print(f"Epoch {ep} time {cur_total_time:.2f} loss {(train_step_loss / max(1, trained_data) / max(1, T_rollout)):.6f}")
 
     if ep % 100 == 0 or cur_total_time >= train_budget:
         ckpt = {
@@ -405,6 +414,26 @@ while cur_total_time < train_budget:
         }
         torch.save(ckpt, os.path.join(save_dir, 'model', 'ffno_checkpoint'))
         shutil.copy(os.path.join(save_dir, 'model', 'ffno_checkpoint'), os.path.join(home_path, save_dir, 'model'))
+
+# Common final dNRMSE report: channelwise relative L2 over each full rollout.
+model.eval()
+dnrmse_sum = 0.0
+dnrmse_count = 0
+with torch.no_grad():
+    for xx, yy in val_loader:
+        window = xx[..., :T_in, :]
+        preds = []
+        for t in range(T_rollout):
+            inp = window.flatten(start_dim=-2).contiguous().to(device)
+            out = model(inp)['forecast'].detach().cpu().unsqueeze(-2)
+            preds.append(out)
+            window = torch.cat([window[..., 1:, :], out], dim=-2)
+        pred_rollout = torch.cat(preds, dim=-2)
+        batch_dnrmse = dimensionwise_nrmse(pred_rollout, yy)
+        dnrmse_sum += float(batch_dnrmse.sum().item())
+        dnrmse_count += int(batch_dnrmse.shape[0])
+test_dnrmse = dnrmse_sum / max(1, dnrmse_count)
+print(f"test dNRMSE: {test_dnrmse}")
 
 # final save
 torch.save(model, os.path.join(save_dir, 'model', 'ffno_model.pt'))

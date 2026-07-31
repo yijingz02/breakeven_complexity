@@ -28,7 +28,7 @@ pretrained: False
 max_epochs: 10000
 epoch_size: 100000
 batch_size: 100
-inference_batch_size: 1000
+inference_batch_size: 100
 n_past: 1              # Input timesteps (NS has 10 total)
 n_future: 1            # Output timesteps to predict
 accum_grad: 5

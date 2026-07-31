@@ -47,20 +47,32 @@ def reshape(x: Array, shape: Union[int, Shape] = -1,
   if not isinstance(shape, Sequence): shape = shape,
   return x.reshape(x.shape[:start] + tuple(shape) + end)
 
-def batched(iterable: Iterable, batch_size: Maybe[int]) -> Iterable:
+def batched(
+    iterable: Iterable, batch_size: Maybe[int], *, drop_last: bool = True
+) -> Iterable:
   """
     Batched iterator.
 
     Args:
       dataset: Dataset iterable.
       batch_size: Collate batch size.
+      drop_last: Whether to omit a final incomplete batch.
   """
   if batch_size is None: return iterable
 
   def collocate(batch: List[PyTree]) -> PyTree:
     with jax.default_device(jax.devices("cpu")[0]):
       return jax.tree.map(lambda *xs: jnp.stack(xs), *batch)
-  return map(collocate, zip(*[iter(iterable)] * batch_size))
+
+  if drop_last:
+    return map(collocate, zip(*[iter(iterable)] * batch_size))
+
+  def collocate_all() -> Iterable:
+    iterator = iter(iterable)
+    while batch := tuple(I.islice(iterator, batch_size)):
+      yield collocate(batch)
+
+  return collocate_all()
 
 def grid(*s: int, mode: str = None, flatten: bool = False) -> Array:
   """

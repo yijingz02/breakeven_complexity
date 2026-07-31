@@ -47,6 +47,7 @@ for b in "${budgets[@]}"; do
           --config.log.wandb_project EddyFormer_NS \
           --config.train.batch_sharding False \
           --config.train.batch_size 64 \
+          --config.train.inference_batch_size 64 \
           --config.train.vmap_batch 1 \
           --config.train.window 1 \
           --config.train.iteration 1000000 \

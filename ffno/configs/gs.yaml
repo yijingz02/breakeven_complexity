@@ -13,6 +13,8 @@ modes: 16
 width: 64
 n_layers: 16
 batch_size: 100
+inference_batch_size: 100
+single_frame_initialization: false
 data_path: ../generated_large_g256_fp32/
 save: output_gs
 mode: full

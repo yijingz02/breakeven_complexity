@@ -341,7 +341,10 @@ def train(
         time_budget_s=time_budget_s,
         gen_time_s=gen_time_s,
         Ndata_generated=Ndata_generated,
-        save_path=save_path
+        save_path=save_path,
+        single_frame_initialization=bool(
+            cfg.data.module_parameters.get("single_frame_initialization", False)
+        )
     )
 
     if cfg.validation_mode:

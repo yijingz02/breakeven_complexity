@@ -30,9 +30,12 @@ parser.add_argument("--ndata", type=int, default=1000, help="Training data size.
 parser.add_argument("--data_path", type=str, default="../generated_large_g256_fp32/", help="Path to data.")
 parser.add_argument("--grid", type=int, default=64, help="Grid size.")
 parser.add_argument("--batch_size", type=int, default=100, help="Batch size for training.")
+parser.add_argument("--inference_batch_size", type=int, default=100, help="Batch size for validation and inference.")
 parser.add_argument("--reduced_resolution", type=int, default=1, help="Downsample factor for grid size.")
 parser.add_argument("--reduced_resolution_t", type=int, default=1, help="Downsample factor for time step (for evaluation).")
 parser.add_argument("--use_autoregressive", action="store_true", default=False, help="Use autoregressive rollout during training.")
+parser.add_argument("--single_frame_initialization", action="store_true", default=False,
+                    help="Initialize the history with repeated copies of its first frame.")
 args = parser.parse_args()
 
 ################################################################
@@ -197,12 +200,14 @@ sub = args.reduced_resolution
 reduced_resolution_t = args.reduced_resolution_t
 
 batch_size = args.batch_size
+inference_batch_size = args.inference_batch_size
 learning_rate = 0.001
 scheduler_gamma = 0.5
 
 S = args.grid
 T_in = 5
 T = 50 - T_in
+T_rollout = T + (T_in - 1 if args.single_frame_initialization else 0)
 
 # Base budget calculation
 downsample_time = per_sample_downsample_time * ntrain
@@ -233,7 +238,7 @@ def load_data(file_index, n):
     print(f"File {file_index} data size:", train_x.shape)
 
     if file_index == "val":
-        train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_x, train_y), batch_size=10, shuffle=False)
+        train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_x, train_y), batch_size=inference_batch_size, shuffle=False)
     else:
         train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_x, train_y), batch_size=batch_size, shuffle=True)
 
@@ -295,8 +300,11 @@ if not use_checkpoint:
     for xx, yy in train_loader:
         xx = xx.to(device)
         yy = yy.to(device)
+        xx, yy = apply_single_frame_initialization(
+            xx, yy, args.single_frame_initialization, time_dim=-1
+        )
 
-        for t in range(T):
+        for t in range(T_rollout):
             if steps_completed >= warmup_steps: break
             
             # 1D Sliding Window formulation
@@ -374,12 +382,15 @@ while cur_total_time <= train_budget:
         trained_data += batch_size
         xx = xx.to(device)
         yy = yy.to(device)
+        xx, yy = apply_single_frame_initialization(
+            xx, yy, args.single_frame_initialization, time_dim=-1
+        )
 
         # Initialize autoregressive state if needed
         if args.use_autoregressive:
             ar_state = xx.clone()  # Start with initial condition
 
-        for t in range(T):
+        for t in range(T_rollout):
             # 1D Sliding Window formulation
             if not args.use_autoregressive:
                 # Teacher forcing: use ground truth
@@ -430,7 +441,7 @@ while cur_total_time <= train_budget:
             "step": scheduler.last_epoch,
             "train_time": cur_total_time,
             "lr": optimizer.param_groups[0]['lr'],
-            "loss": train_step_loss / trained_data / T,
+            "loss": train_step_loss / trained_data / T_rollout,
         })
 
     if ep % 100 == 0:
@@ -467,17 +478,21 @@ worst_idx  = -1
 global_base = 0
 full_loss_sum = 0
 n_eval = 0
+dnrmse_sum = 0.0
 
 # Track purely the forward pass time
 total_inference_time = 0.0 
 
 with torch.no_grad():
     for xx, yy in val_loader:
+        xx, yy = apply_single_frame_initialization(
+            xx, yy, args.single_frame_initialization, time_dim=-1
+        )
         B = xx.shape[0]
         window = xx # (B, S, T_in)
 
         preds_list = []
-        for t in range(T):
+        for t in range(T_rollout):
             inp = window.contiguous().to(device, non_blocking=True) 
             
             # --- Start Inference Timer ---
@@ -506,8 +521,10 @@ with torch.no_grad():
 
         preds = torch.cat(preds_list, dim=-1)
         per_sample = traj_l2(preds, yy)
+        dnrmse_batch = dimensionwise_nrmse(preds, yy, channel_dim=None)
 
         full_loss_sum += float(loss_fn(preds, yy).item())
+        dnrmse_sum += float(dnrmse_batch.sum().item())
         n_eval += B
 
         batch_worst_loss, batch_worst_j = torch.max(per_sample, dim=0)
@@ -520,8 +537,9 @@ with torch.no_grad():
 
         global_base += B
 
-val_step_loss /= (max(1, n_eval) * T)
+val_step_loss /= (max(1, n_eval) * T_rollout)
 test_full_loss = full_loss_sum / max(1, n_eval)
+test_dnrmse = dnrmse_sum / max(1, n_eval)
 
 # Calculate average rollout time per trajectory
 avg_rollout_time_per_traj = total_inference_time / max(1, ntest)
@@ -531,12 +549,14 @@ wandb.log({
     "worst_traj_idx": worst_idx,
     "test_step_loss": val_step_loss,
     "test_full_loss": test_full_loss,
+    "test/dnrmse": test_dnrmse,
     "total_inference_time": total_inference_time,
     "avg_rollout_time_per_traj": avg_rollout_time_per_traj
 })
 
 print(f"val_step_loss: {val_step_loss}")
 print(f"test_full_loss: {test_full_loss}")
+print(f"test dNRMSE: {test_dnrmse}")
 print(f"[TEST] worst trajectory idx = {worst_idx}, worst L2 loss = {worst_loss}")
 print(f"[TEST] Total Rollout Time: {total_inference_time:.4f}s")
 print(f"[TEST] Avg Rollout Time per Trajectory: {avg_rollout_time_per_traj:.4f}s")

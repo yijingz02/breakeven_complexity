@@ -13,6 +13,8 @@ modes: 16
 width: 64
 n_layers: 24
 batch_size: 16
+inference_batch_size: 16
+single_frame_initialization: false
 data_path: .
 save: output_mo
 mode: full

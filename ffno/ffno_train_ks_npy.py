@@ -79,6 +79,12 @@ parser.add_argument(
     help="Batch size for training."
 )
 parser.add_argument(
+    "--inference_batch_size",
+    type=int,
+    default=100,
+    help="Batch size for validation and inference."
+)
+parser.add_argument(
     "--reduced_resolution",
     type=int,
     default=1,
@@ -90,6 +96,8 @@ parser.add_argument(
     default=1,
     help="Downsample factor for time step (for evaluation)."
 )
+parser.add_argument("--single_frame_initialization", action="store_true", default=False,
+                    help="Initialize the history with repeated copies of its first frame.")
 args = parser.parse_args()
 
 import os
@@ -316,6 +324,7 @@ if train_budget <= 0:
 print(f"train budget: {train_budget}")
 
 batch_size = args.batch_size
+inference_batch_size = args.inference_batch_size
 learning_rate = 0.001
 
 scheduler_step = int((train_budget // per_step_time) * 0.1)
@@ -328,7 +337,8 @@ t1 = time.time()
 
 S = args.grid
 T_in = 5
-T = 50 - 1
+T = 50 - T_in
+T_rollout = T + (T_in - 1 if args.single_frame_initialization else 0)
 T_eval = 999
 step = 1
 
@@ -340,20 +350,21 @@ def load_data(file_index, n):
     u = np.load(args.data_path + f"data_{file_index}_u.npy", mmap_mode="r+")
     fields_u = torch.from_numpy(u).float()
 
-    padding = fields_u[:n, ::sub, ::sub, 0:1].repeat(1, 1, 1, T_in)
-    full_seq = torch.cat([padding, fields_u[:n, ::sub, ::sub, :]], dim=-1)
-    
-    train_x = full_seq[..., :T_in] 
-    train_y = full_seq[..., T_in + 1:]
+    if args.single_frame_initialization:
+        train_x = fields_u[:n, ::sub, ::sub, 0:1].repeat(1, 1, 1, T_in)
+        train_y = fields_u[:n, ::sub, ::sub, 1:1 + T_rollout]
+    else:
+        train_x = fields_u[:n, ::sub, ::sub, :T_in]
+        train_y = fields_u[:n, ::sub, ::sub, T_in:T_in + T_rollout]
     
     train_x = train_x.reshape(n, S//sub, S//sub, T_in, 1)
-    train_y = train_y.reshape(n, S//sub, S//sub, T, 1)
+    train_y = train_y.reshape(n, S//sub, S//sub, T_rollout, 1)
 
     print("data size:", train_x.shape)
     print("data device", train_x.device)
 
     if file_index == "val":
-        train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_x, train_y), batch_size=10, shuffle=False)
+        train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_x, train_y), batch_size=inference_batch_size, shuffle=False)
     else:
         train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(train_x, train_y), batch_size=batch_size, shuffle=True)
 
@@ -457,7 +468,7 @@ for xx, yy in train_loader:
 
     B = xx.shape[0]
 
-    for t in range(T):
+    for t in range(T_rollout):
         optimizer.zero_grad(set_to_none=True)
 
         if t == 0:
@@ -511,7 +522,7 @@ while cur_total_time <= train_budget:
 
             B = xx.shape[0]
 
-            for t in range(T):
+            for t in range(T_rollout):
                 optimizer.zero_grad(set_to_none=True)
 
                 if t == 0:
@@ -565,7 +576,7 @@ while cur_total_time <= train_budget:
             "step": scheduler.last_epoch,
             "train_time": cur_total_time,
             "lr": optimizer.param_groups[0]['lr'],
-            "loss": train_step_loss / trained_data / T,
+            "loss": train_step_loss / trained_data / T_rollout,
         })
 
     if ep % 100 == 0:
@@ -604,6 +615,8 @@ def traj_l2(preds, targets):
 model.eval()
 
 val_step_loss = 0
+dnrmse_sum = 0.0
+dnrmse_count = 0
 worst_loss = -math.inf
 worst_idx  = -1
 
@@ -616,7 +629,7 @@ with torch.no_grad():
         window = xx[..., :T_in, :]     # CPU: (B,S,S,T_in,1)
 
         preds_list = []
-        for t in range(T):
+        for t in range(T_rollout):
             inp = window.squeeze(-1).contiguous().to(device, non_blocking=True) 
             out = model(inp)['forecast']                  
 
@@ -632,6 +645,9 @@ with torch.no_grad():
 
         preds = torch.cat(preds_list, dim=-2)
         per_sample = traj_l2(preds, yy)
+        dnrmse_batch = dimensionwise_nrmse(preds, yy)
+        dnrmse_sum += float(dnrmse_batch.sum().item())
+        dnrmse_count += int(dnrmse_batch.shape[0])
 
         batch_worst_loss, batch_worst_j = torch.max(per_sample, dim=0)
         batch_worst_loss = float(batch_worst_loss.item())
@@ -643,13 +659,16 @@ with torch.no_grad():
 
         global_base += B
 
-val_step_loss /= (ntest * T)
+val_step_loss /= (ntest * T_rollout)
+test_dnrmse = dnrmse_sum / max(1, dnrmse_count)
 
 wandb.log({
     "worst_l2_loss": worst_loss,
     "worst_traj_idx": worst_idx,
     "test_step_loss": val_step_loss,
+    "test/dnrmse": test_dnrmse,
 })
 
 print(f"val_step_loss: {val_step_loss}")
+print(f"test dNRMSE: {test_dnrmse}")
 print(f"[TEST] worst trajectory idx = {worst_idx}, worst L2 loss = {worst_loss}")

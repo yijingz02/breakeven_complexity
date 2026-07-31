@@ -5,6 +5,8 @@ wandb_data_name: gs_exponax
 module_parameters:
   _target_: walrus.data.MixedWellDataModule
   batch_size: 100
+  inference_batch_size: 100
+  single_frame_initialization: false
   n_steps_input: 10
   n_steps_output: 1
   min_dt_stride: 1

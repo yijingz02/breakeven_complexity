@@ -32,6 +32,8 @@ def get_config() -> ConfigDict:
 # ----------------------------------- BATCH ---------------------------------- #
       # training batch size
       "batch_size": 16,
+      # validation and inference batch size
+      "inference_batch_size": 16,
       # vectorization
       "vmap_batch": 1,
       # sharded over GPUs
@@ -43,6 +45,8 @@ def get_config() -> ConfigDict:
       "window": 1,
       # use autoregressive rollout during training
       "use_autoregressive": False,
+      # fill a multi-frame initial history with copies of its first frame
+      "single_frame_initialization": False,
       # gradient clipping
       "gradient_clip": placeholder(float),
       "data_gen_time": 0.0,

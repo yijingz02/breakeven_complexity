@@ -47,6 +47,7 @@ parser.add_argument("--budget", type=float, default=100, help="Time budget in se
 parser.add_argument("--ndata", type=int, default=1000, help="Training data size.")
 parser.add_argument("--data_path", type=str, default="../generated_large_g256_fp32/", help="Path to .npy data.")
 parser.add_argument("--batch_size", type=int, default=100, help="Batch size.")
+parser.add_argument("--inference_batch_size", type=int, default=100, help="Batch size for validation and inference.")
 parser.add_argument("--reduced_resolution", type=int, default=1, help="Downsample factor for H/W.")
 parser.add_argument("--noise_std", type=float, default=0.01, help="Input Gaussian noise std.")
 
@@ -70,6 +71,8 @@ parser.add_argument("--mean_p",  type=float, default=-0.39420366287231445)
 parser.add_argument("--std_vx",  type=float, default=0.6491641402244568)
 parser.add_argument("--std_vy",  type=float, default=0.5268091559410095)
 parser.add_argument("--std_p",   type=float, default=1.060120940208435)
+parser.add_argument("--single_frame_initialization", action="store_true", default=False,
+                    help="Initialize the history with repeated copies of its first frame.")
 
 args = parser.parse_args()
 
@@ -256,6 +259,7 @@ if train_budget <= 0:
 print(f"train budget: {train_budget:.2f}")
 
 batch_size = int(args.batch_size)
+inference_batch_size = int(args.inference_batch_size)
 learning_rate = 1e-3
 
 scheduler_step = max(1, int((train_budget // per_step_time) * 0.1))
@@ -267,6 +271,7 @@ T_in = int(args.T_in)
 T_total_used = int(args.T_total_used)
 assert T_total_used > T_in, "Need T_total_used > T_in"
 T = T_total_used - T_in  # rollout steps per traj chunk
+T_rollout = T + (T_in - 1 if args.single_frame_initialization else 0)
 
 # normalization tensors
 MEAN = torch.tensor([args.mean_vx, args.mean_vy, args.mean_p], dtype=torch.float32)  # (3,)
@@ -379,7 +384,7 @@ def load_data(file_index, n):
     if file_index == "val":
         loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(x, y, mask),
-            batch_size=10,
+            batch_size=inference_batch_size,
             shuffle=False
         )
     else:
@@ -460,10 +465,13 @@ if use_checkpoint:
 for xx, yy, mask in train_loader:
     xx = xx.to(device)      # (B,H,W,T_in,3)
     yy = yy.to(device)      # (B,H,W,T,3)
+    xx, yy = apply_single_frame_initialization(
+        xx, yy, args.single_frame_initialization
+    )
     mask = mask.to(device)  # (B,H,W,1)
     fluid = to_fluid_mask(mask)
 
-    for t in range(T):
+    for t in range(T_rollout):
         optimizer.zero_grad(set_to_none=True)
 
         if t == 0:
@@ -513,13 +521,16 @@ while cur_total_time <= train_budget:
     for xx, yy, mask in train_loader:
         xx = xx.to(device, non_blocking=True)
         yy = yy.to(device, non_blocking=True)
+        xx, yy = apply_single_frame_initialization(
+            xx, yy, args.single_frame_initialization
+        )
         mask = mask.to(device, non_blocking=True)
         fluid = to_fluid_mask(mask)
 
         B = xx.shape[0]
         trained_data += B
 
-        for t in range(T):
+        for t in range(T_rollout):
             optimizer.zero_grad(set_to_none=True)
 
             if t == 0:
@@ -560,7 +571,7 @@ while cur_total_time <= train_budget:
             break
 
     if (ep % 10 == 0) or (cur_total_time > train_budget):
-        denom = max(1, trained_data) * T
+        denom = max(1, trained_data) * T_rollout
         wandb.log({
             "epoch": ep,
             "step": scheduler.last_epoch,
@@ -597,9 +608,14 @@ val_step_loss_sum = 0.0
 worst_loss = -math.inf
 worst_idx = -1
 global_base = 0
+dnrmse_sum = 0.0
+dnrmse_count = 0
 
 with torch.no_grad():
     for xx, yy, mask in val_loader:
+        xx, yy = apply_single_frame_initialization(
+            xx, yy, args.single_frame_initialization
+        )
         B = xx.shape[0]
 
         # keep window on CPU like your original eval
@@ -607,7 +623,7 @@ with torch.no_grad():
         mask_cpu = mask               # (B,H,W,1) on CPU
 
         preds_list = []
-        for t in range(T):
+        for t in range(T_rollout):
             win_d = window.contiguous().to(device, non_blocking=True)        # (B,H,W,T_in,3)
             mask_d = mask_cpu.contiguous().to(device, non_blocking=True)     # (B,H,W,1)
             fluid_d = to_fluid_mask(mask_d)                                  # (B,H,W,1)
@@ -635,8 +651,11 @@ with torch.no_grad():
         preds = torch.cat(preds_list, dim=-2)                                # (B,H,W,T,3)
 
         fluid_cpu = to_fluid_mask(mask_cpu) if not args.no_mask_loss else None  # (B,H,W,1) or None
-        per_sample = traj_l2(preds, yy, fluid=fluid_cpu) / T
+        per_sample = traj_l2(preds, yy, fluid=fluid_cpu) / T_rollout
         # per_sample = traj_rel_l2(preds, yy, fluid=fluid_cpu)
+        dnrmse_batch = dimensionwise_nrmse(preds, yy)
+        dnrmse_sum += float(dnrmse_batch.sum().item())
+        dnrmse_count += int(dnrmse_batch.shape[0])
 
         batch_worst_loss, batch_worst_j = torch.max(per_sample, dim=0)
         batch_worst_loss = float(batch_worst_loss.item())
@@ -648,13 +667,16 @@ with torch.no_grad():
 
         global_base += B
 
-val_step_loss = val_step_loss_sum / (ntest * T)
+val_step_loss = val_step_loss_sum / (ntest * T_rollout)
+test_dnrmse = dnrmse_sum / max(1, dnrmse_count)
 
 wandb.log({
     "worst_l2_loss": worst_loss,
     "worst_traj_idx": worst_idx,
     "test_step_loss": val_step_loss,
+    "test/dnrmse": test_dnrmse,
 })
 
 print(f"val_step_loss: {val_step_loss}")
+print(f"test dNRMSE: {test_dnrmse}")
 print(f"[TEST] worst trajectory idx = {worst_idx}, worst L2 loss = {worst_loss}")

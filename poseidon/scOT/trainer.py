@@ -481,12 +481,47 @@ class Trainer(Trainer_):
         if self.ar_steps is not None and output_all_steps:
             self.output_all_steps = True
 
+    @staticmethod
+    def _next_rollout_input(model, pixel_values, prediction):
+        prediction = prediction.detach()
+        channel_difference = (
+            model.config.num_channels > model.config.num_out_channels
+        )
+        if not channel_difference:
+            return prediction
+
+        if not getattr(model.config, "single_frame_initialization", False):
+            return torch.cat(
+                [
+                    prediction,
+                    pixel_values[:, model.config.num_out_channels :],
+                ],
+                dim=1,
+            )
+
+        history_length = int(
+            getattr(model.config, "temporal_history_length", 1)
+        )
+        static_channels = int(getattr(model.config, "static_input_channels", 0))
+        out_channels = model.config.num_out_channels
+        dynamic_channels = history_length * out_channels
+        if dynamic_channels + static_channels != pixel_values.shape[1]:
+            raise ValueError(
+                "Configured temporal/static channels do not match rollout input: "
+                f"{dynamic_channels}+{static_channels}!={pixel_values.shape[1]}"
+            )
+        shifted_history = torch.cat(
+            [pixel_values[:, out_channels:dynamic_channels], prediction], dim=1
+        )
+        if static_channels:
+            shifted_history = torch.cat(
+                [shifted_history, pixel_values[:, dynamic_channels:]], dim=1
+            )
+        return shifted_history
+
     def _model_forward(self, model, inputs):
         # print("model forward called")
         if self.ar_steps is not None and model.config.use_conditioning:
-            channel_difference = (
-                model.config.num_channels > model.config.num_out_channels
-            )
             # TODO: if outputs is not a dataclass this will break
             if isinstance(self.ar_steps, int):
                 inputs = {**inputs, **{"time": inputs["time"] / self.ar_steps}}
@@ -517,22 +552,9 @@ class Trainer(Trainer_):
                             loss += outputs.loss
                     inputs = {
                         **inputs,
-                        **{
-                            "pixel_values": (
-                                outputs.output.detach()
-                                if not channel_difference
-                                else torch.cat(
-                                    [
-                                        outputs.output.detach(),
-                                        inputs["pixel_values"][
-                                            :,
-                                            model.config.num_out_channels :,
-                                        ],
-                                    ],
-                                    dim=1,
-                                )
-                            )
-                        },
+                        "pixel_values": self._next_rollout_input(
+                            model, inputs["pixel_values"], outputs.output
+                        ),
                     }
                 if self.output_all_steps:
                     outputs.output = torch.stack(outputs_, dim=1)
@@ -572,8 +594,6 @@ class Trainer(Trainer_):
                     outputs = model(**inputs)
                     if self.output_all_steps:
                         outputs_.append(outputs.output.detach())
-                    if self.output_all_steps:
-                        outputs_.append(outputs.output.detach())
                         if outputs.hidden_states is not None:
                             hidden_states_.append(outputs.hidden_states)
                         if outputs.attentions is not None:
@@ -589,22 +609,9 @@ class Trainer(Trainer_):
                             loss += outputs.loss
                     inputs = {
                         **inputs,
-                        **{
-                            "pixel_values": (
-                                outputs.output.detach()
-                                if not channel_difference
-                                else torch.cat(
-                                    [
-                                        outputs.output.detach(),
-                                        inputs["pixel_values"][
-                                            :,
-                                            model.config.num_out_channels :,
-                                        ],
-                                    ],
-                                    dim=1,
-                                )
-                            )
-                        },
+                        "pixel_values": self._next_rollout_input(
+                            model, inputs["pixel_values"], outputs.output
+                        ),
                     }
                 if self.output_all_steps:
                     outputs.output = torch.stack(outputs_, dim=1)

@@ -50,6 +50,8 @@ class MixedWellDataModule:
             ],
         ],
         batch_size: int,
+        inference_batch_size: Optional[int] = None,
+        single_frame_initialization: bool = False,
         use_normalization: bool = False,
         field_index_map_override: Dict[str, int] = {},
         return_grid: bool = True,
@@ -108,7 +110,9 @@ class MixedWellDataModule:
             - path: Optional custom path for this specific dataset
             - field_transforms: Optional dictionary of field transformations
         batch_size:
-            Size of the batches yielded by the dataloaders
+            Size of the batches yielded by the training dataloader.
+        inference_batch_size:
+            Size of validation and test batches. Defaults to ``batch_size``.
         use_normalization:
             Whether or not to use normalization.
         field_index_map_override:
@@ -173,6 +177,7 @@ class MixedWellDataModule:
             Additional keyword arguments to pass to each dataset.
         """
         self.global_field_transforms = global_field_transforms or {}
+        self.single_frame_initialization = bool(single_frame_initialization)
         if transform is not None:
             # If transform is a single Augmentation, apply it to all datasets
             if isinstance(transform, Augmentation):
@@ -396,6 +401,9 @@ class MixedWellDataModule:
             for dset_name in well_dataset_info
         ]
         self.batch_size = batch_size
+        self.inference_batch_size = (
+            batch_size if inference_batch_size is None else inference_batch_size
+        )
         self.world_size = world_size
         self.data_workers = data_workers
         self.rank = rank
@@ -484,7 +492,7 @@ class MixedWellDataModule:
         full: bool = False,
     ) -> List[DataLoader]:
         return self.build_loaders_from_dset_list(
-            self.val_datasets, self.batch_size, replicas, rank, full
+            self.val_datasets, self.inference_batch_size, replicas, rank, full
         )
 
     def rollout_val_dataloaders(
@@ -495,7 +503,7 @@ class MixedWellDataModule:
     ) -> List[DataLoader]:
         return self.build_loaders_from_dset_list(
             self.rollout_val_datasets,
-            1,  # Batch size hardcoded to one since 3D data uses so much memory - can be fixed, but not priority
+            self.inference_batch_size,
             replicas,
             rank,
             full,
@@ -508,7 +516,7 @@ class MixedWellDataModule:
         full: bool = True,
     ) -> List[DataLoader]:
         return self.build_loaders_from_dset_list(
-            self.test_datasets, self.batch_size, replicas, rank, full
+            self.test_datasets, self.inference_batch_size, replicas, rank, full
         )
 
     def rollout_test_dataloaders(
@@ -519,7 +527,7 @@ class MixedWellDataModule:
     ) -> List[DataLoader]:
         return self.build_loaders_from_dset_list(
             self.rollout_test_datasets,
-            1,  # Batch size hardcoded to one since 3D data uses so much memory - can be fixed, but not priority
+            self.inference_batch_size,
             replicas,
             rank,
             full,

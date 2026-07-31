@@ -176,3 +176,41 @@ class LpLoss(object):
 
     def __call__(self, x, y):
         return self.rel(x, y)
+
+
+def dimensionwise_nrmse(pred, target, channel_dim=-1, eps=1e-12):
+    """Per-sample mean of per-channel relative L2 over all other dimensions."""
+    pred = pred.float()
+    target = target.float()
+    if channel_dim is None:
+        pred = pred.reshape(pred.shape[0], -1, 1)
+        target = target.reshape(target.shape[0], -1, 1)
+    else:
+        pred = pred.movedim(channel_dim, -1)
+        target = target.movedim(channel_dim, -1)
+        channels = target.shape[-1]
+        pred = pred.reshape(pred.shape[0], -1, channels)
+        target = target.reshape(target.shape[0], -1, channels)
+    numerator = (pred - target).square().sum(dim=1)
+    denominator = target.square().sum(dim=1).clamp_min(eps)
+    return torch.sqrt(numerator / denominator).mean(dim=1)
+def apply_single_frame_initialization(history, targets, enabled=False, time_dim=-2):
+    """Left-pad a rollout with copies of its first frame.
+
+    The ground-truth frames that originally formed the remaining input history
+    are prepended to ``targets``.  Existing training code can therefore keep
+    its current window-update policy (teacher forcing or autoregressive).
+    """
+    if not enabled or history.shape[time_dim] <= 1:
+        return history, targets
+
+    time_dim = time_dim % history.ndim
+    target_time_dim = time_dim % targets.ndim
+    remaining_history = history.narrow(time_dim, 1, history.shape[time_dim] - 1)
+    targets = torch.cat([remaining_history, targets], dim=target_time_dim)
+
+    first_frame = history.narrow(time_dim, 0, 1)
+    repeats = [1] * history.ndim
+    repeats[time_dim] = history.shape[time_dim]
+    history = first_frame.repeat(*repeats)
+    return history, targets

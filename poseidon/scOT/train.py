@@ -59,6 +59,30 @@ def nrmse(pred: np.ndarray, ref: np.ndarray) -> float:
     return float(np.sqrt(np.square(pred - ref).sum() / denom))
 
 
+def dimensionwise_nrmse(
+    preds: torch.Tensor, labels: torch.Tensor, eps: float = 1e-12
+) -> torch.Tensor:
+    """Per-sample mean of per-channel relative L2 over the full prediction."""
+    if preds.ndim == 5 and labels.ndim == 4 and preds.shape[1] == 1:
+        preds = preds[:, 0]
+    elif preds.ndim == 4 and labels.ndim == 5 and labels.shape[1] == 1:
+        labels = labels[:, 0]
+    if labels.ndim == 5:  # N,T,C,H,W
+        channel_dim = 2
+    elif labels.ndim == 4:  # N,C,H,W
+        channel_dim = 1
+    else:
+        raise ValueError(f"Unsupported dNRMSE tensor shape: {tuple(labels.shape)}")
+    preds = preds.float().movedim(channel_dim, -1)
+    labels = labels.float().movedim(channel_dim, -1)
+    batch_size, channels = labels.shape[0], labels.shape[-1]
+    diff = (preds - labels).reshape(batch_size, -1, channels)
+    ref = labels.reshape(batch_size, -1, channels)
+    numerator = diff.square().sum(dim=1)
+    denominator = ref.square().sum(dim=1).clamp_min(eps)
+    return torch.sqrt(numerator / denominator).mean(dim=1)
+
+
 MODEL_MAP = {
     "T": {
         "num_heads": [3, 6, 12, 24],
@@ -348,9 +372,12 @@ def _channelwise_physical_nrmse_multi_obstacle(
 
 def _extract_multi_obstacle_reference_rollout(dataset, rollout_steps: int) -> np.ndarray:
     history = int(getattr(dataset, "history", 5))
+    reference_start = (
+        1 if getattr(dataset, "single_frame_initialization", False) else history
+    )
     frame_axis = 1 if getattr(dataset, "_layout", "NTHW") == "NTHW" else 3
     total_frames = int(dataset._vx.shape[frame_axis])
-    rollout_steps = min(int(rollout_steps), total_frames - history)
+    rollout_steps = min(int(rollout_steps), total_frames - reference_start)
     if rollout_steps <= 0:
         raise ValueError(
             f"Cannot extract a rollout with history={history} from a trajectory with {total_frames} frames."
@@ -360,7 +387,7 @@ def _extract_multi_obstacle_reference_rollout(dataset, rollout_steps: int) -> np
     for traj_id in range(int(dataset._num_traj_total)):
         _, local_idx = dataset._traj_to_file_local(int(traj_id))
         traj = []
-        for t in range(history, history + rollout_steps):
+        for t in range(reference_start, reference_start + rollout_steps):
             vx = dataset._get_frame(dataset._vx, local_idx, t)
             vy = dataset._get_frame(dataset._vy, local_idx, t)
             p = dataset._get_frame(dataset._p, local_idx, t)
@@ -820,6 +847,7 @@ def compute_test_worst_and_log(
     # Global relative L2 (your existing convention)
     lp_loss = LpLoss(size_average=True)
     global_rel_l2 = lp_loss(preds, labels).item()
+    mean_dnrmse = dimensionwise_nrmse(preds, labels).mean().item()
 
     # Per-trajectory mean + worst
     worst_idx, worst_rel_l2, worst_abs_l2, mean_rel_l2 = worst_traj_relative_l2(preds, labels)
@@ -827,6 +855,7 @@ def compute_test_worst_and_log(
     print(f"[{prefix.upper()}] preds shape: {tuple(preds.shape)}")
     print(
         f"[{prefix.upper()}] global_rel_l2={global_rel_l2:.6g} | "
+        f"dnrmse={mean_dnrmse:.6g} | "
         f"mean_per_traj_rel_l2={mean_rel_l2:.6g} | "
         f"worst_rel_l2={worst_rel_l2:.6g} (idx={worst_idx}) | "
         f"worst_abs_l2_norm={worst_abs_l2:.6g}"
@@ -837,6 +866,7 @@ def compute_test_worst_and_log(
         metrics[f"{prefix}/" + key[1:]] = value
 
     metrics[f"{prefix}/relative_l2_loss"] = global_rel_l2
+    metrics[f"{prefix}/dnrmse"] = mean_dnrmse
     metrics[f"{prefix}/mean_per_traj_relative_l2_loss"] = mean_rel_l2
     metrics[f"{prefix}/worst_relative_l2_loss"] = worst_rel_l2
     # metrics[f"{prefix}/worst_abs_l2_norm"] = worst_abs_l2
@@ -926,6 +956,9 @@ def setup(params, model_map=True):
     if params.batch_size is not None:
         config["batch_size"] = int(params.batch_size)
 
+    if params.inference_batch_size is not None:
+        config["inference_batch_size"] = int(params.inference_batch_size)
+
     if params.lr is not None:
         config["lr"] = float(params.lr)
 
@@ -984,6 +1017,9 @@ if __name__ == "__main__":
         if ("incompressible" in config["dataset"]) and params.just_velocities
         else {}
     )
+    train_eval_set_kwargs["single_frame_initialization"] = bool(
+        config.get("single_frame_initialization", False)
+    )
     if params.move_data is not None:
         train_eval_set_kwargs["move_to_local_scratch"] = params.move_data
     if params.max_num_train_time_steps is not None:
@@ -1041,6 +1077,7 @@ if __name__ == "__main__":
         output_dim = train_dataset.output_dim
         channel_slice_list = train_dataset.channel_slice_list
         printable_channel_description = train_dataset.printable_channel_description
+        temporal_history_length = int(getattr(train_dataset, "history", 1))
     else:
         resolution = train_dataset.datasets[0].resolution
         input_dim = train_dataset.datasets[0].input_dim
@@ -1049,6 +1086,13 @@ if __name__ == "__main__":
         printable_channel_description = train_dataset.datasets[
             0
         ].printable_channel_description
+        temporal_history_length = int(
+            getattr(train_dataset.datasets[0], "history", 1)
+        )
+    static_input_channels = input_dim - temporal_history_length * output_dim
+    if static_input_channels < 0:
+        temporal_history_length = 1
+        static_input_channels = input_dim - output_dim
 
     model_config = (
         ScOTConfig(
@@ -1075,6 +1119,11 @@ if __name__ == "__main__":
             residual_model="convnext",
             use_conditioning=time_involved,
             learn_residual=False,
+            temporal_history_length=temporal_history_length,
+            static_input_channels=static_input_channels,
+            single_frame_initialization=bool(
+                config.get("single_frame_initialization", False)
+            ),
         )
         if params.finetune_from is None or params.replace_embedding_recovery
         else None
@@ -1110,6 +1159,11 @@ if __name__ == "__main__":
             config=model_config,
             ignore_mismatched_sizes=True,
         )
+    model.config.temporal_history_length = temporal_history_length
+    model.config.static_input_channels = static_input_channels
+    model.config.single_frame_initialization = bool(
+        config.get("single_frame_initialization", False)
+    )
     num_params = get_num_parameters(model)
     config["num_params"] = num_params
     num_params_no_embed = get_num_parameters_no_embed(model)
@@ -1197,7 +1251,9 @@ if __name__ == "__main__":
             evaluation_strategy="no",
             per_device_train_batch_size=min(100, config["batch_size"]),
             gradient_accumulation_steps=max(config["batch_size"] // 100, 1),
-            per_device_eval_batch_size=config["batch_size"],
+            per_device_eval_batch_size=config.get(
+                "inference_batch_size", config["batch_size"]
+            ),
             eval_accumulation_steps=16,
             max_grad_norm=config["max_grad_norm"],
             num_train_epochs=config["num_epochs"],
@@ -1322,6 +1378,12 @@ if __name__ == "__main__":
             if ("incompressible" in config["dataset"]) and params.just_velocities
             else {}
         )
+        test_set_kwargs["single_frame_initialization"] = bool(
+            config.get("single_frame_initialization", False)
+        )
+        out_test_set_kwargs["single_frame_initialization"] = bool(
+            config.get("single_frame_initialization", False)
+        )
         if params.move_data is not None:
             test_set_kwargs["move_to_local_scratch"] = params.move_data
             out_test_set_kwargs["move_to_local_scratch"] = params.move_data
@@ -1414,6 +1476,12 @@ if __name__ == "__main__":
                 "history": rollout_history,
                 "T_len": 1,
                 "resolution": config["image_size"],
+                "single_frame_initialization": bool(
+                    config.get("single_frame_initialization", False)
+                ),
+                "initialization_only": bool(
+                    config.get("single_frame_initialization", False)
+                ),
             }
             if params.move_data is not None:
                 long_rollout_set_kwargs["move_to_local_scratch"] = params.move_data
@@ -1433,16 +1501,26 @@ if __name__ == "__main__":
             long_rollout_dataset._load_file(0)
 
             frame_axis = 1 if getattr(long_rollout_dataset, "_layout", "NTHW") == "NTHW" else 3
-            available_rollout_steps = int(long_rollout_dataset._vx.shape[frame_axis]) - rollout_history
-            long_rollout_steps = min(requested_total_frames - rollout_history, available_rollout_steps)
-            if available_rollout_steps < requested_total_frames - rollout_history:
+            initialization_frames = (
+                1
+                if config.get("single_frame_initialization", False)
+                else rollout_history
+            )
+            requested_rollout_steps = requested_total_frames - initialization_frames
+            available_rollout_steps = (
+                int(long_rollout_dataset._vx.shape[frame_axis])
+                - initialization_frames
+            )
+            long_rollout_steps = min(requested_rollout_steps, available_rollout_steps)
+            if available_rollout_steps < requested_rollout_steps:
                 print(
                     f"WARNING: only {available_rollout_steps} rollout steps are available from the stored trajectory; "
-                    f"requested {requested_total_frames - rollout_history}."
+                    f"requested {requested_rollout_steps}."
                 )
             print(
-                f"Using history={rollout_history} and {long_rollout_steps} autoregressive steps "
-                f"to evaluate {rollout_history + long_rollout_steps} total frames."
+                f"Using {initialization_frames} observed initialization frame(s) and "
+                f"{long_rollout_steps} autoregressive steps to evaluate "
+                f"{initialization_frames + long_rollout_steps} total frames."
             )
 
             old_inference_time = trainer.inference_time
@@ -1451,7 +1529,9 @@ if __name__ == "__main__":
             old_ar_steps = trainer.ar_steps
             old_output_all_steps = trainer.output_all_steps
             trainer.inference_time = 0.0
-            trainer.args.per_device_eval_batch_size = 1
+            trainer.args.per_device_eval_batch_size = config.get(
+                "inference_batch_size", config["batch_size"]
+            )
             trainer.compute_metrics = None
             trainer.set_ar_steps([1] * long_rollout_steps, output_all_steps=True)
             torch.cuda.empty_cache()
@@ -1519,7 +1599,7 @@ if __name__ == "__main__":
                     rollout_preds_norm,
                     rollout_refs_norm,
                     wandb_prefix="test/long_rollout",
-                    max_steps=requested_total_frames - rollout_history,
+                    max_steps=requested_rollout_steps,
                 )
 
                 short_rollout_steps = min(14, rollout_preds.shape[1], rollout_refs.shape[1])

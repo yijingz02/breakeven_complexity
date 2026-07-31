@@ -30,6 +30,7 @@ class GrayScottMultiFile(BaseTimeDataset):
         self.max_traj_per_file = kwargs.get("max_traj_per_file")
         self.num_trajectories = kwargs.get("num_trajectories")
 
+        self.history = 10
         self.input_dim = 20 # u,v * 10 frames
         self.output_dim = 2
 
@@ -52,7 +53,11 @@ class GrayScottMultiFile(BaseTimeDataset):
         self.frames = 200
         self.T_len  = 10
 
-        self.samples_per_traj = self.frames - self.T_len
+        self.samples_per_traj = (
+            self.frames - 1
+            if self.single_frame_initialization
+            else self.frames - self.T_len
+        )
 
         self._traj_per_file = self.max_traj_per_file
 
@@ -144,7 +149,7 @@ class GrayScottMultiFile(BaseTimeDataset):
     def __getitem__(self, idx):
         traj_id = idx // self.samples_per_traj
         t1      = idx %  self.samples_per_traj
-        t2      = t1 + self.T_len
+        t2      = t1 + (1 if self.single_frame_initialization else self.T_len)
 
         file_idx  = (traj_id % self.num_trajectories) // self.max_traj_per_file
         local_idx = (traj_id % self.num_trajectories) %  self.max_traj_per_file
@@ -159,8 +164,13 @@ class GrayScottMultiFile(BaseTimeDataset):
         traj_u = self._u[local_idx]
         traj_v = self._v[local_idx]
 
-        u_in  = traj_u[:, :, t1:t2]
-        v_in  = traj_v[:, :, t1:t2]
+        if self.single_frame_initialization:
+            indices = [max(0, t1 - self.history + 1 + i) for i in range(self.history)]
+            u_in = traj_u[:, :, indices]
+            v_in = traj_v[:, :, indices]
+        else:
+            u_in = traj_u[:, :, t1:t2]
+            v_in = traj_v[:, :, t1:t2]
         u_out = traj_u[:, :, t2]
         v_out = traj_v[:, :, t2]
 
@@ -170,7 +180,14 @@ class GrayScottMultiFile(BaseTimeDataset):
         inputs = (inputs - self.constants["mean"][:, None, None, None]) / self.constants["std"][:, None, None, None]
         labels = (labels - self.constants["mean"][:, None, None])       / self.constants["std"][:, None, None]
 
-        inputs = inputs.permute(0, 3, 1, 2).reshape(self.input_dim, self.resolution, self.resolution)
+        if self.single_frame_initialization:
+            inputs = inputs.permute(3, 0, 1, 2).reshape(
+                self.input_dim, self.resolution, self.resolution
+            )
+        else:
+            inputs = inputs.permute(0, 3, 1, 2).reshape(
+                self.input_dim, self.resolution, self.resolution
+            )
         time = 10.0
 
         # print("inputs shape:", inputs.shape)

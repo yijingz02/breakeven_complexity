@@ -13,6 +13,7 @@ for NDATA in "${ndatas[@]}"; do
     optimizer=adam optimizer.lr=1e-3 logger.wandb_project_name="walrus_ks" \
     trainer.enable_amp=True model.gradient_checkpointing_freq=1 trainer.log_interval=1000 trainer.clip_gradient=10 \
     data.module_parameters.batch_size=100 \
+    data.module_parameters.inference_batch_size=100 \
     data.module_parameters.n_steps_input=5 \
     data.module_parameters.n_steps_output=1 \
     data.module_parameters.well_dataset_info.ks_exponax.path="${DATA_PATH}" \

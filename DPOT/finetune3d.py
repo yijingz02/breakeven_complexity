@@ -15,7 +15,7 @@ from torch.optim.lr_scheduler import OneCycleLR, StepLR, LambdaLR, CosineAnneali
 from torch.utils.tensorboard import SummaryWriter
 from utils.optimizer import Adam, Lamb
 from utils.utilities import count_parameters, get_grid, load_3d_components_from_2d
-from utils.criterion import SimpleLpLoss
+from utils.criterion import SimpleLpLoss, dimensionwise_nrmse
 from utils.griddataset import MixedTemporalDataset, TemporalDataset3D
 from utils.make_master_file import DATASET_DICT
 from models.unet import UNet
@@ -69,6 +69,8 @@ parser.add_argument('--n_blocks',type=int, default=8)
 parser.add_argument('--mlp_ratio',type=int, default=1)
 
 parser.add_argument('--batch_size', type=int, default=4)
+parser.add_argument('--inference_batch_size', type=int, default=4,
+                    help='Batch size used by validation and test dataloaders')
 parser.add_argument('--epochs', type=int, default=500)
 parser.add_argument('--lr', type=float, default=0.001)
 parser.add_argument('--opt',type=str, default='adam', choices=['adam','lamb'])
@@ -83,6 +85,8 @@ parser.add_argument('--sub', type=int, default=1)
 parser.add_argument('--T_in', type=int, default=10)
 parser.add_argument('--T_ar', type=int, default=1)
 parser.add_argument('--T_bundle', type=int, default=1)
+parser.add_argument('--single_frame_initialization', action='store_true', default=False,
+                    help='Repeat the first frame to initialize the history, then roll forward normally')
 parser.add_argument('--gpu', type=str, default="6")
 parser.add_argument('--comment',type=str, default="")
 parser.add_argument('--log_path',type=str,default='')
@@ -95,6 +99,14 @@ parser.add_argument('--load_components',nargs='+', type=str, default=['blocks'])
 
 
 args = parser.parse_args()
+
+
+def apply_single_frame_initialization(history, targets):
+    if not args.single_frame_initialization or history.shape[-2] <= 1:
+        return history, targets
+    targets = torch.cat((history[..., 1:, :], targets), dim=-2)
+    history = history[..., :1, :].repeat_interleave(history.shape[-2], dim=-2)
+    return history, targets
 
 
 device = torch.device("cuda:{}".format(args.gpu))
@@ -114,7 +126,7 @@ train_dataset = TemporalDataset3D(args.train_path, n_train=args.ntrain, res=args
 test_dataset = TemporalDataset3D(args.test_path, res=args.res, t_in=args.T_in, t_ar=args.T_ar, normalize=False, train=False)
 
 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False,num_workers=8)
+test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.inference_batch_size, shuffle=False,num_workers=8)
 ntrain, ntest = len(train_dataset), len(test_dataset)
 print('Train num {} test num {}'.format(len(train_dataset), len(test_dataset)))
 ################################################################
@@ -198,6 +210,7 @@ for ep in range(args.epochs):
         loss, cls_loss = 0. , 0.
         xx = xx.to(device)  ## B, n, n, T_in, C
         yy = yy.to(device)  ## B, n, n, T_ar, C
+        xx, yy = apply_single_frame_initialization(xx, yy)
         msk = msk.to(device)
         # cls = cls.to(device)
 
@@ -253,10 +266,12 @@ for ep in range(args.epochs):
         model.eval()
 
         test_l2_full, test_l2_step = 0, 0
+        test_dnrmse_sum, test_dnrmse_count = 0.0, 0
         for xx, yy, msk in test_loader:
             loss = 0
             xx = xx.to(device)
             yy = yy.to(device)
+            xx, yy = apply_single_frame_initialization(xx, yy)
             msk = msk.to(device)
 
 
@@ -274,13 +289,18 @@ for ep in range(args.epochs):
 
             test_l2_step += loss.item()
             test_l2_full += myloss(pred, yy, mask=msk)
+            dnrmse_batch = dimensionwise_nrmse(pred, yy)
+            test_dnrmse_sum += dnrmse_batch.sum().item()
+            test_dnrmse_count += int(dnrmse_batch.shape[0])
 
         test_l2_step_avg, test_l2_full_avg = test_l2_step / ntest / (yy.shape[-2] / args.T_bundle), test_l2_full / ntest
+        test_dnrmse = test_dnrmse_sum / max(1, test_dnrmse_count)
         test_l2_steps.append(test_l2_step_avg)
         test_l2_fulls.append(test_l2_full_avg)
         if args.use_writer:
             writer.add_scalar("test_loss_step_{}".format(args.test_path), test_l2_step_avg, ep)
             writer.add_scalar("test_loss_full_{}".format(args.test_path), test_l2_full_avg, ep)
+            writer.add_scalar("test_dnrmse_{}".format(args.test_path), test_dnrmse, ep)
 
     if args.use_writer:
         torch.save({'args': args, 'model': model.state_dict(), 'optimizer': optimizer.state_dict()}, model_path)
@@ -288,8 +308,5 @@ for ep in range(args.epochs):
     t_test = default_timer() - t_1
     t2 = t_1 = default_timer()
     lr = optimizer.param_groups[0]['lr']
-    print('epoch {}, time {:.5f}, lr {:.2e}, train l2 step {:.5f} train l2 full {:.5f}, test l2 step {} test l2 full {}, cls acc {:.5f}, time train avg {:.5f} load avg {:.5f} test {:.5f}'.format(ep, t2 - t1, lr,train_l2_step_avg, train_l2_full_avg,', '.join(['{:.5f}'.format(val) for val in test_l2_steps]),', '.join(['{:.5f}'.format(val) for val in test_l2_fulls]), cls_acc, t_train / len(train_loader), t_load / len(train_loader), t_test))
-
-
-
+    print('epoch {}, time {:.5f}, lr {:.2e}, train l2 step {:.5f} train l2 full {:.5f}, test l2 step {} test l2 full {}, test dNRMSE {:.5f}, cls acc {:.5f}, time train avg {:.5f} load avg {:.5f} test {:.5f}'.format(ep, t2 - t1, lr,train_l2_step_avg, train_l2_full_avg,', '.join(['{:.5f}'.format(val) for val in test_l2_steps]),', '.join(['{:.5f}'.format(val) for val in test_l2_fulls]), test_dnrmse, cls_acc, t_train / len(train_loader), t_load / len(train_loader), t_test))
 

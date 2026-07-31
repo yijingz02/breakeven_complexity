@@ -131,8 +131,12 @@ class TheWell(Flow):
 
       it = slice(None)
       if window is not None:
-        s = jrand.choice(prng, len(ts) - window - self.n_steps_input + 1).item()
-        ts = ts[(it:=slice(s, s + window + self.n_steps_input))]
+        initialization_frames = (
+          1 if getattr(self, "single_frame_initialization", False)
+          else self.n_steps_input
+        )
+        s = jrand.choice(prng, len(ts) - window - initialization_frames + 1).item()
+        ts = ts[(it:=slice(s, s + window + initialization_frames))]
 
       inputs, output, field_names = [], [], []
       for order, key in enumerate(["t0_fields", "t1_fields", "t2_fields"]):
@@ -141,13 +145,17 @@ class TheWell(Flow):
           input = utils.reshape(data, -1, self.ndim + 1)
 
           if field.attrs["time_varying"]:
+            output_start = (
+              1 if getattr(self, "single_frame_initialization", False)
+              else self.n_steps_input
+            )
             if order == 0:
               field_names.append(name)
-              output.append(input[self.n_steps_input:])
+              output.append(input[output_start:])
             else:
               for i in jnp.argwhere(jnp.ones(data.shape[-order:])):
                 field_names.append(f"{name}@{''.join(map(str, i))}")
-                output.append(input[self.n_steps_input:, ..., i])
+                output.append(input[output_start:, ..., i])
           else:
             input = jnp.repeat(input, len(ts), axis=0)
 
@@ -173,5 +181,16 @@ class TheWell(Flow):
     output = jnp.concatenate(output, axis=-1)
 
     size = jnp.ones(self.ndim) # TODO: domain
+    if getattr(self, "single_frame_initialization", False):
+      data = []
+      for current_step, (ut, t) in enumerate(zip(output, ts[1:])):
+        indices = [
+          max(0, current_step - self.n_steps_input + 1 + i)
+          for i in range(self.n_steps_input)
+        ]
+        ic = Grid(jnp.concatenate([inputs[i] for i in indices], axis=-1), size)
+        data.append(Flow.Data_t(t, ic, Grid(ut, size)))
+      return data
+
     return [Flow.Data_t(t, Grid(jnp.concatenate(ics, axis=-1), size), Grid(ut, size)) \
        for ics, ut, t in zip(zip(*(inputs[i:] for i in range(self.n_steps_input))), output, ts[self.n_steps_input:])]

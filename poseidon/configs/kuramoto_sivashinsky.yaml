@@ -32,6 +32,10 @@ num_epochs:
   value: 10000000000
 batch_size:
   value: 300
+inference_batch_size:
+  value: 300
+single_frame_initialization:
+  value: false
 max_grad_norm:
   value: 5.0
 eta_step_time:

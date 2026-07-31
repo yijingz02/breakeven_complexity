@@ -34,6 +34,18 @@ def nrmse(y_true, y_pred, dims=(-1,)):
     return (mse / norm).sqrt()
 
 
+def dimensionwise_nrmse(y_pred, y_true, channel_dim, eps=1e-12):
+    """Per-sample mean of per-channel relative L2 over all other dimensions."""
+    y_pred = y_pred.float().movedim(channel_dim, -1)
+    y_true = y_true.float().movedim(channel_dim, -1)
+    batch_size, channels = y_true.shape[0], y_true.shape[-1]
+    diff = (y_pred - y_true).reshape(batch_size, -1, channels)
+    ref = y_true.reshape(batch_size, -1, channels)
+    numerator = diff.square().sum(dim=1)
+    denominator = ref.square().sum(dim=1).clamp_min(eps)
+    return torch.sqrt(numerator / denominator).mean(dim=1)
+
+
 class LpLoss(object):
     """Lp-norm loss with proper size averaging.
     
@@ -150,6 +162,34 @@ def model_rollout(
             outputs.append(out)
         out = torch.cat(outputs, dim=1)
     return out, metadata
+
+
+def apply_single_frame_initialization(inp, tar, enabled=False):
+    """Use only the first input frame while retaining early frames as targets."""
+    if not enabled or inp.shape[1] <= 1:
+        return inp, tar
+    tar = torch.cat([inp[:, 1:, ...], tar], dim=1)
+    inp = inp[:, :1, ...].repeat(1, inp.shape[1], *([1] * (inp.ndim - 2)))
+    return inp, tar
+
+
+def single_frame_teacher_forcing_stages(inp, tar):
+    """Construct left-padded histories while keeping ground-truth updates."""
+    history_length = inp.shape[1]
+    sequence = torch.cat([inp, tar], dim=1)
+    first = sequence[:, :1, ...]
+    stages = []
+    for target_idx in range(1, sequence.shape[1]):
+        available = sequence[:, :target_idx, ...]
+        if target_idx < history_length:
+            padding = first.repeat(
+                1, history_length - target_idx, *([1] * (inp.ndim - 2))
+            )
+            context = torch.cat([padding, available], dim=1)
+        else:
+            context = available[:, -history_length:, ...]
+        stages.append((context, sequence[:, target_idx:target_idx + 1, ...]))
+    return stages
 
 
 _TIME_AVG_QUANTITIES = [
@@ -679,22 +719,31 @@ class Trainer:
                 
                 # forward
                 tt.track("forward", "training", "forw_batch")
-                output, metadata = self.model(
-                    inp, predict_normed=False, 
-                    # n_future_steps=self.params.n_future, 
-                    state_labels=state_labels[0],
-                    dset_name=dset_name,
-                )
-                tar = (tar - metadata['mean']) / metadata['std']  # normalize tar
+                if getattr(self.params, 'single_frame_initialization', False):
+                    stages = single_frame_teacher_forcing_stages(inp, tar)
+                else:
+                    stages = [(inp, tar)]
 
-                # Apply mask if present (mask shape [B,1,1,H,W])
-                if mask is not None:
-                    tar = tar * mask
-                    output = output * mask
+                loss = 0.0
+                loss_raw = 0.0
+                for stage_inp, stage_tar in stages:
+                    output, metadata = self.model(
+                        stage_inp, predict_normed=False,
+                        state_labels=state_labels[0],
+                        dset_name=dset_name,
+                    )
+                    stage_tar = (stage_tar - metadata['mean']) / metadata['std']
+                    if mask is not None:
+                        stage_tar = stage_tar * mask
+                        output = output * mask
+                    stage_loss, stage_loss_raw = self.mse_loss(stage_tar, output)
+                    loss = loss + stage_loss
+                    loss_raw = loss_raw + stage_loss_raw
+                loss = loss / len(stages)
+                loss_raw = loss_raw / len(stages)
 
                 # loss
                 tt.track("loss", "training", "loss_batch")
-                loss, loss_raw = self.mse_loss(tar, output)
                 loss = loss / self.params.accum_grad
 
                 # logs
@@ -937,6 +986,11 @@ class Trainer:
                             # indicates we need to split the input 
                             tar = torch.cat([inp[:,n_past:,...], tar], dim=1)
                             inp = inp[:,:n_past,...]
+                        inp, tar = apply_single_frame_initialization(
+                            inp,
+                            tar,
+                            getattr(self.params, 'single_frame_initialization', False),
+                        )
 
                         state_labels = torch.tensor(
                             self.train_dataset.subset_dict.get(subset.get_name(), [-1]*len(self.valid_dataset.subset_dict[subset.get_name()])),
@@ -1003,6 +1057,7 @@ class Trainer:
                 eval_steps = [1, 2, 4, 8, 16, 32, 64, 128]
                 sample_sum_full = {dset_name: torch.zeros(1, device=self.device, dtype=self.base_dtype) for dset_name in distinct_dsets}
                 sample_sum_step = {dset_name: torch.zeros(1, device=self.device, dtype=self.base_dtype) for dset_name in distinct_dsets}
+                sample_sum_dnrmse = {dset_name: torch.zeros(1, device=self.device, dtype=self.base_dtype) for dset_name in distinct_dsets}
                 sample_counts = {dset_name: torch.zeros(1, device=self.device, dtype=self.base_dtype) for dset_name in distinct_dsets}
                 time_avg_sums = {
                     dset_name: {
@@ -1081,6 +1136,11 @@ class Trainer:
                         if inp.shape[1] > n_past:
                             tar = torch.cat([inp[:, n_past:, ...], tar], dim=1)
                             inp = inp[:, :n_past, ...]
+                        inp, tar = apply_single_frame_initialization(
+                            inp,
+                            tar,
+                            getattr(self.params, 'single_frame_initialization', False),
+                        )
 
                         state_labels = torch.tensor(
                             self.train_dataset.subset_dict.get(subset.get_name(), [-1]*len(self.test_dataset.subset_dict.get(subset.get_name(), ['x']))),
@@ -1143,6 +1203,9 @@ class Trainer:
                         # Whole-rollout relative L2: ||pred-target||_2 / ||target||_2 per sample
                         lp_loss = LpLoss(d=2, p=2, size_average=False, reduction=False)
                         rollout_rel_per_sample = lp_loss.rel(metric_output, metric_tar)  # Shape: [batch]
+                        dnrmse_per_sample = dimensionwise_nrmse(
+                            metric_output, metric_tar, channel_dim=2
+                        )
                         
                         # Step-averaged: mean relative L2 over all timesteps per sample
                         # Reshape to [batch*time, channels*H*W] for per-timestep relative L2
@@ -1160,6 +1223,7 @@ class Trainer:
                         # Accumulate per-sample sums and counts for sample-weighted averaging
                         sample_sum_full[dset_name] += rollout_rel_per_sample.sum()
                         sample_sum_step[dset_name] += step_rel_per_sample.sum()
+                        sample_sum_dnrmse[dset_name] += dnrmse_per_sample.sum()
                         sample_counts[dset_name] += float(metric_tar.shape[0])
                         
                         if physical_batch_scores is not None:
@@ -1192,6 +1256,7 @@ class Trainer:
                     dist.all_reduce(counts[dset_name])
                     dist.all_reduce(sample_sum_full[dset_name])
                     dist.all_reduce(sample_sum_step[dset_name])
+                    dist.all_reduce(sample_sum_dnrmse[dset_name])
                     dist.all_reduce(sample_counts[dset_name])
                 for dset_name in time_avg_sums:
                     for key in time_avg_sums[dset_name]:
@@ -1211,10 +1276,12 @@ class Trainer:
                     logs[f'{dset_name}/test_nrmse_rollout'] = sample_sum_full[dset_name] / sample_counts[dset_name]
                     logs[f'{dset_name}/test_nrmse_step'] = sample_sum_step[dset_name] / sample_counts[dset_name]
                     logs[f'{dset_name}/test_relative_l2_rollout'] = sample_sum_full[dset_name] / sample_counts[dset_name]
+                    logs[f'{dset_name}/test_dnrmse'] = sample_sum_dnrmse[dset_name] / sample_counts[dset_name]
                 else:
                     logs[f'{dset_name}/test_nrmse_rollout'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
                     logs[f'{dset_name}/test_nrmse_step'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
                     logs[f'{dset_name}/test_relative_l2_rollout'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
+                    logs[f'{dset_name}/test_dnrmse'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
 
             for dset_name in time_avg_sums:
                 for key, score_sum in time_avg_sums[dset_name].items():
@@ -1250,10 +1317,12 @@ class Trainer:
             logs['test_nrmse_rollout'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
             logs['test_nrmse_step'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
             logs['test_relative_l2_rollout'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
+            logs['test_dnrmse'] = torch.zeros(1, device=self.device, dtype=self.base_dtype)
             for dset_name in distinct_dsets:
                 nrmse_key = f'{dset_name}/test_nrmse_rollout'
                 step_key = f'{dset_name}/test_nrmse_step'
                 rel_l2_key = f'{dset_name}/test_relative_l2_rollout'
+                dnrmse_key = f'{dset_name}/test_dnrmse'
                 if nrmse_key in logs:
                     logs['test_nrmse'] += logs[nrmse_key] / len(distinct_dsets)
                     logs['test_nrmse_rollout'] += logs[nrmse_key] / len(distinct_dsets)
@@ -1261,6 +1330,9 @@ class Trainer:
                     logs['test_nrmse_step'] += logs[step_key] / len(distinct_dsets)
                 if rel_l2_key in logs:
                     logs['test_relative_l2_rollout'] += logs[rel_l2_key] / len(distinct_dsets)
+                if dnrmse_key in logs:
+                    logs['test_dnrmse'] += logs[dnrmse_key] / len(distinct_dsets)
+            logs['test/dnrmse'] = logs['test_dnrmse']
 
             if float(total_inference_samples.item()) > 0:
                 logs['time/inference_wallclock_total'] = total_inference_wallclock
@@ -1429,6 +1501,10 @@ if __name__ == '__main__':
     parser.add_argument("--wandb_project", type=str, default=None, help='WandB project name override')
     parser.add_argument("--time_budget", type=float, default=None, help='Time budget in seconds (placeholder for future use)')
     parser.add_argument("--ntrain", type=int, default=None, help='Number of training samples to load/use per epoch')
+    parser.add_argument("--inference_batch_size", type=int, default=None,
+                        help='Override the validation and test batch size from the YAML config')
+    parser.add_argument("--single_frame_initialization", action=argparse.BooleanOptionalAction,
+                        default=None, help='Repeat the first frame to initialize temporal history')
     parser.add_argument("--per_data_gen_cost", type=float, default=0.0, help='Per-sample data generation cost in seconds')
     parser.add_argument("--checkpoint_dir", type=str, default=None,
                         help='Directory for checkpoints; defaults under MODEL_STORAGE_ROOT/DISCO and resumes if ckpt.tar exists')
@@ -1455,6 +1531,10 @@ if __name__ == '__main__':
         params['ntrain'] = int(args.ntrain)
     else:
         params['ntrain'] = None
+    if args.inference_batch_size is not None:
+        params['inference_batch_size'] = int(args.inference_batch_size)
+    if args.single_frame_initialization is not None:
+        params['single_frame_initialization'] = bool(args.single_frame_initialization)
     params['per_data_gen_cost'] = float(args.per_data_gen_cost)
     params['timing_warmup_steps'] = int(args.timing_warmup_steps)
     params['timing_avg_steps'] = int(args.timing_avg_steps)

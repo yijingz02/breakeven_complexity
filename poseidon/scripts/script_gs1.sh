@@ -17,5 +17,6 @@ for ndata in "${ndatas[@]}"; do
         --ndata=$ndata \
         --time_budget=$BUDGET \
         --batch_size=100 \
+        --inference_batch_size=100 \
         --lr=1e-3
 done

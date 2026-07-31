@@ -17,7 +17,7 @@ from torch.optim.lr_scheduler import OneCycleLR, StepLR, LambdaLR, CosineAnneali
 from torch.utils.tensorboard import SummaryWriter
 from utils.optimizer import Adam, Lamb
 from utils.utilities import count_parameters, get_grid, load_model_from_checkpoint
-from utils.criterion import SimpleLpLoss
+from utils.criterion import SimpleLpLoss, dimensionwise_nrmse
 from utils.griddataset import MixedTemporalDataset
 from utils.make_master_file import DATASET_DICT
 from models.fno import FNO2d
@@ -68,6 +68,8 @@ parser.add_argument('--mlp_ratio',type=int, default=1)
 parser.add_argument('--out_layer_dim', type=int, default=32)
 
 parser.add_argument('--batch_size', type=int, default=20)
+parser.add_argument('--inference_batch_size', type=int, default=20,
+                    help='Batch size used by validation and test dataloaders')
 parser.add_argument('--epochs', type=int, default=500)
 parser.add_argument('--lr', type=float, default=0.001)
 parser.add_argument('--opt',type=str, default='adam', choices=['adam','lamb'])
@@ -81,6 +83,8 @@ parser.add_argument('--warmup_epochs',type=int, default=100)
 parser.add_argument('--T_in', type=int, default=10)
 parser.add_argument('--T_ar', type=int, default=1)
 parser.add_argument('--T_bundle', type=int, default=1)
+parser.add_argument('--single_frame_initialization', action='store_true', default=False,
+                    help='Repeat the first frame to initialize the history, then roll forward normally')
 parser.add_argument('--gpu', type=str, default="5")
 parser.add_argument('--comment',type=str, default="")
 parser.add_argument('--log_path',type=str,default='')
@@ -95,6 +99,14 @@ parser.add_argument('--sched_warmup_steps', type=int, default=10, help='Number o
 parser.add_argument('--sched_profile_steps', type=int, default=5, help='Number of profiled optimization steps for average step-time estimation')
 parser.add_argument('--sched_time_multiplier', type=float, default=1.2, help='Conservative multiplier for profiled step time when estimating total steps')
 args = parser.parse_args()
+
+
+def apply_single_frame_initialization(history, targets):
+    if not args.single_frame_initialization or history.shape[-2] <= 1:
+        return history, targets
+    targets = torch.cat((history[..., 1:, :], targets), dim=-2)
+    history = history[..., :1, :].repeat_interleave(history.shape[-2], dim=-2)
+    return history, targets
 
 
 def _time_avg_nrmse_per_sample(pred, ref, eps=1e-12):
@@ -222,7 +234,7 @@ else:
 train_dataset = MixedTemporalDataset(args.train_paths, ntrain_list, res=args.res, t_in = args.T_in, t_ar = args.T_ar, normalize=False,train=True, data_weights=args.data_weights)
 test_datasets = [MixedTemporalDataset(test_path, res=args.res, n_channels = train_dataset.n_channels,t_in = args.T_in, t_ar=-1, normalize=False, train=False) for i, test_path in enumerate(test_paths)]
 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=False)
-test_loaders = [torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False,num_workers=8) for test_dataset in test_datasets]
+test_loaders = [torch.utils.data.DataLoader(test_dataset, batch_size=args.inference_batch_size, shuffle=False,num_workers=8) for test_dataset in test_datasets]
 ntrain, ntests = len(train_dataset), [len(test_dataset) for test_dataset in test_datasets]
 print('Train num {} test num {}'.format(train_dataset.n_sizes, ntests))
 ################################################################
@@ -396,6 +408,7 @@ if (not stopped_by_budget) and actual_budget > 0:
         loss = 0.
         xx = xx.to(device)
         yy = yy.to(device)
+        xx, yy = apply_single_frame_initialization(xx, yy)
         msk = msk.to(device)
         warmup_samples_seen += xx.shape[0]
         if warmup_rollout_steps_per_sample is None:
@@ -488,6 +501,7 @@ while True:
         loss, cls_loss = 0. , 0.
         xx = xx.to(device)  ## B, n, n, T_in, C
         yy = yy.to(device)  ## B, n, n, T_ar, C
+        xx, yy = apply_single_frame_initialization(xx, yy)
         msk = msk.to(device)
         cls = cls.to(device)
 
@@ -610,6 +624,7 @@ test_l2_fulls, test_l2_steps = [], []
 test_rollout_time_per_trajs = []
 test_time_avg_stats = []
 test_physical_nrmse_stats = []
+test_dnrmse_scores = []
 worst_traj_l2 = -float('inf')
 worst_traj_idx = -1
 worst_traj_dataset = -1
@@ -624,11 +639,14 @@ with torch.no_grad():
         time_avg_counts = {}
         physical_nrmse_sum = torch.zeros(3, dtype=torch.float64, device=device)
         physical_nrmse_count = 0
+        dnrmse_sum = torch.zeros(1, dtype=torch.float64, device=device)
+        dnrmse_count = 0
         dataset_base_idx = 0
         for xx, yy, msk, _ in test_loader:
             loss = 0
             xx = xx.to(device)
             yy = yy.to(device)
+            xx, yy = apply_single_frame_initialization(xx, yy)
             msk = msk.to(device)
             batch_size_eval = xx.shape[0]
             rollout_t0 = default_timer()
@@ -651,6 +669,9 @@ with torch.no_grad():
             test_l2_step += loss
             per_traj_full = myloss(pred, yy, mask=msk)
             test_l2_full += per_traj_full.item()
+            dnrmse_batch = dimensionwise_nrmse(pred, yy)
+            dnrmse_sum += dnrmse_batch.double().sum()
+            dnrmse_count += int(dnrmse_batch.shape[0])
 
             if 'custom_bf' in test_paths[id]:
                 physical_batch_scores = channelwise_physical_nrmse_breakflow(
@@ -691,6 +712,7 @@ with torch.no_grad():
         test_l2_steps.append(test_l2_step_avg)
         test_l2_fulls.append(test_l2_full_avg)
         test_rollout_time_per_trajs.append(rollout_time_per_traj)
+        test_dnrmse_scores.append(float(dnrmse_sum / max(1, dnrmse_count)))
         dataset_time_avg_stats = {
             key: time_avg_sums[key] / max(1, time_avg_counts[key])
             for key in time_avg_sums
@@ -735,6 +757,12 @@ for dataset_name, step_val, full_val in zip(test_paths, test_l2_steps, test_l2_f
     safe_name = dataset_name.replace('/', '_')
     final_log[f'final/test/{safe_name}/l2_step'] = step_val
     final_log[f'final/test/{safe_name}/l2_full'] = full_val
+for dataset_name, dnrmse_val in zip(test_paths, test_dnrmse_scores):
+    safe_name = dataset_name.replace('/', '_')
+    final_log[f'final/test/{safe_name}/dnrmse'] = dnrmse_val
+if test_dnrmse_scores:
+    final_log['final/test/dnrmse'] = float(np.mean(test_dnrmse_scores))
+    final_log['test/dnrmse'] = final_log['final/test/dnrmse']
 for dataset_name, rollout_time_val in zip(test_paths, test_rollout_time_per_trajs):
     safe_name = dataset_name.replace('/', '_')
     final_log[f'final/test/{safe_name}/rollout_time_per_traj'] = rollout_time_val
@@ -762,6 +790,7 @@ final_log['final/worst_traj_dataset_id'] = worst_traj_dataset
 wandb.log(final_log)
 print('final test, l2 step {}, l2 full {}, test time {:.5f}'.format(', '.join(['{:.5f}'.format(val) for val in test_l2_steps]), ', '.join(['{:.5f}'.format(val) for val in test_l2_fulls]), test_time))
 print('final rollout inference time per trajectory {}, mean {:.5f}'.format(', '.join(['{:.5f}s'.format(val) for val in test_rollout_time_per_trajs]), final_log['final/rollout_time_per_traj']))
+print('final dNRMSE {}, mean {:.5f}'.format(', '.join(['{:.5f}'.format(val) for val in test_dnrmse_scores]), final_log.get('final/test/dnrmse', 0.0)))
 print(f"[TEST] worst trajectory idx = {worst_traj_idx}, dataset_id = {worst_traj_dataset}, worst full-trajectory L2 = {final_log['final/worst_traj_l2']:.5f}")
 
 wandb.finish()

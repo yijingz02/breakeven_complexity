@@ -117,7 +117,13 @@ def read_cli(parser):
         "--batch_size",
         type=int,
         required=False,
-        help="Batch size.",
+        help="Training batch size.",
+    )
+    parser.add_argument(
+        "--inference_batch_size",
+        type=int,
+        required=False,
+        help="Batch size for validation and inference.",
     )
     parser.add_argument(
         "--do_inference",

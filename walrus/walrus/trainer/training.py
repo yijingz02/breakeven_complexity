@@ -99,6 +99,14 @@ class RelativeL2(Metric):
         return {self.name: rel}
 
 
+def dimensionwise_nrmse(y_pred, y_ref, eps=1e-12):
+    """Return B,C relative L2 reduced over the complete rollout and spatial axes."""
+    reduction_dims = tuple(range(1, y_ref.ndim - 1))
+    numerator = (y_pred - y_ref).float().square().sum(dim=reduction_dims)
+    denominator = y_ref.float().square().sum(dim=reduction_dims).clamp_min(eps)
+    return torch.sqrt(numerator / denominator)
+
+
 def _canonical_multi_obstacle_field_name(name: str) -> str | None:
     normalized = str(name).lower().replace(" ", "_")
     aliases = {
@@ -495,6 +503,7 @@ class Trainer:
         gen_time_s: float = 0.0,                 # seconds per generated trajectory/sample (one-time)
         Ndata_generated: Optional[int] = None,   # fixed up-front #trajectories/samples generated
         save_path: Optional[str] = None,
+        single_frame_initialization: bool = False,
     ):
         """
         Class in charge of the training loop. It performs train, validation and test.
@@ -612,6 +621,7 @@ class Trainer:
         self.log_interval = log_interval
         self.device = device
         self.model = model
+        self.single_frame_initialization = bool(single_frame_initialization)
         self.datamodule = datamodule
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
@@ -751,6 +761,41 @@ class Trainer:
         self.infer_n_cnt = 0
         self.infer_cnt = 0
 
+    @staticmethod
+    def _single_frame_teacher_forcing_batch(batch):
+        """Sample teacher-forced left-padded startup stages without growing B."""
+        history = batch["input_fields"]
+        targets = batch["output_fields"]
+        history_length = history.shape[1]
+        sequence = torch.cat([history, targets], dim=1)
+        contexts = []
+        stage_targets = []
+        target_indices = torch.randint(
+            1, sequence.shape[1], (history.shape[0],)
+        )
+        for sample_idx, target_idx_tensor in enumerate(target_indices):
+            target_idx = int(target_idx_tensor.item())
+            available = sequence[sample_idx:sample_idx + 1, :target_idx]
+            first = sequence[sample_idx:sample_idx + 1, :1]
+            if target_idx < history_length:
+                padding = first.repeat(
+                    1,
+                    history_length - target_idx,
+                    *([1] * (history.ndim - 2)),
+                )
+                context = torch.cat([padding, available], dim=1)
+            else:
+                context = available[:, -history_length:]
+            contexts.append(context)
+            stage_targets.append(
+                sequence[sample_idx:sample_idx + 1, target_idx:target_idx + 1]
+            )
+
+        result = dict(batch)
+        result["input_fields"] = torch.cat(contexts, dim=0)
+        result["output_fields"] = torch.cat(stage_targets, dim=0)
+        return result
+
     def save_model_if_necessary(
         self, epoch: int, validation_loss: float, last: bool = False
     ) -> Optional[Future]:
@@ -790,6 +835,14 @@ class Trainer:
             else v
             for k, v in batch.items()
         }
+        single_frame_training = (
+            train
+            and self.single_frame_initialization
+            and batch["input_fields"].shape[1] > 1
+        )
+        if single_frame_training:
+            batch = self._single_frame_teacher_forcing_batch(batch)
+        T_in = batch["input_fields"].shape[1]
         # Extract mask and move to device for loss eval
         if (
             self.masked_loss_for_objects
@@ -816,14 +869,20 @@ class Trainer:
 
         inputs, y_ref = formatter.process_input(
             batch,
-            causal_in_time=model.causal_in_time,
+            causal_in_time=model.causal_in_time and not single_frame_training,
             predict_delta=self.prediction_type == "delta",
             train=train,
         )
+        if self.single_frame_initialization and not train and T_in > 1:
+            y_ref = torch.cat([batch["input_fields"][:, 1:], y_ref], dim=1)
+            batch["input_fields"] = batch["input_fields"][:, :1].repeat(
+                1,
+                T_in,
+                *([1] * (batch["input_fields"].ndim - 2)),
+            )
 
         # Inputs T B C H [W D], y_ref B T H [W D] C
         # If causal, during training don't include initial context in rollout length
-        T_in = batch["input_fields"].shape[1]
         if full_rollout:
             max_rollout_steps = y_ref.shape[1]
         elif model.causal_in_time:
@@ -833,7 +892,11 @@ class Trainer:
         rollout_steps = min(
             y_ref.shape[1], max_rollout_steps
         )  # Number of timesteps in target
-        train_rollout_limit = T_in if (train and model.causal_in_time) else 1
+        train_rollout_limit = (
+            1
+            if single_frame_training
+            else (T_in if (train and model.causal_in_time) else 1)
+        )
         if rollout_steps > train_rollout_limit and train:
             raise ValueError("Multiple step prediction in train mode not yet supported")
         y_ref = y_ref[:, :rollout_steps]
@@ -908,7 +971,9 @@ class Trainer:
             # _check_finite("y_pred_internal (model output)", y_pred_internal)
 
             # During validation, don't maintain full inner predictions
-            if not train and model.causal_in_time:
+            if single_frame_training:
+                y_pred = y_pred[-1:]
+            elif not train and model.causal_in_time:
                 y_pred = y_pred[-1:]  # y_pred is T first, y_ref is not
             # Train used normalized values to avoid precision loss
             # Validation on the other hand, reconstructs predictions on original scale
@@ -1727,6 +1792,32 @@ class Trainer:
                         f for ii, f in enumerate(field_names) if batch["padded_field_mask"][ii]
                     ]
 
+                    dnrmse_channel_scores = dimensionwise_nrmse(
+                        y_pred, y_ref, eps=self.validation_epsilon
+                    )
+                    for channel_idx, field_name in enumerate(used_field_names):
+                        loss_name = f"{dset_name}/dimensionwise_nrmse/{field_name}"
+                        channel_scores = (
+                            dnrmse_channel_scores[:, channel_idx].detach().cpu()
+                        )
+                        if loss_name in rank_loss_dict:
+                            rank_loss_dict[loss_name] = torch.cat(
+                                [rank_loss_dict[loss_name], channel_scores], dim=0
+                            )
+                        else:
+                            rank_loss_dict[loss_name] = channel_scores
+                    dnrmse_macro_name = f"{dset_name}/dnrmse"
+                    dnrmse_macro_scores = (
+                        dnrmse_channel_scores.mean(dim=1).detach().cpu()
+                    )
+                    if dnrmse_macro_name in rank_loss_dict:
+                        rank_loss_dict[dnrmse_macro_name] = torch.cat(
+                            [rank_loss_dict[dnrmse_macro_name], dnrmse_macro_scores],
+                            dim=0,
+                        )
+                    else:
+                        rank_loss_dict[dnrmse_macro_name] = dnrmse_macro_scores
+
                     if dset_name.lower() == "breakflow":
                         physical_batch_scores = channelwise_physical_nrmse(
                             y_pred,
@@ -2061,6 +2152,21 @@ class Trainer:
                 )
                 if self.wandb_logging:
                     wandb.log(physical_nrmse_wandb, commit=False)
+
+            dnrmse_wandb = {}
+            for metadata in metadatas:
+                dset_name = metadata.dataset_name
+                key = f"{dset_name}/dnrmse"
+                if key not in loss_dict:
+                    continue
+                mean_dnrmse = loss_dict[key].float().mean().item()
+                dnrmse_wandb[f"test/{dset_name}/dnrmse"] = mean_dnrmse
+            if len(dnrmse_wandb) == 1:
+                dnrmse_wandb["test/dnrmse"] = next(iter(dnrmse_wandb.values()))
+            if dnrmse_wandb:
+                logger.info("Dimensionwise nRMSE: %s", dnrmse_wandb)
+                if self.wandb_logging:
+                    wandb.log(dnrmse_wandb, commit=False)
 
         # Single score validation loss is average of all losses on the training metric
         validation_loss = sum(
